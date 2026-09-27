@@ -23,9 +23,6 @@ export class CreateJobDto {
   @IsString()
   location: string;
 
-  @IsString()
-  clientId: string;
-
   @IsOptional()
   @IsArray()
   @IsString({ each: true })

@@ -12,8 +12,8 @@ export class JobsService {
     private jobsRepository: Repository<Job>,
   ) {}
 
-  create(createJobDto: CreateJobDto) {
-    const job = this.jobsRepository.create(createJobDto);
+  create(createJobDto: CreateJobDto, clientId: string) {
+    const job = this.jobsRepository.create({ ...createJobDto, clientId });
     return this.jobsRepository.save(job);
   }
 
