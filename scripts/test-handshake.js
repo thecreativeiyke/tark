@@ -3,10 +3,11 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-// Read PAYSTACK_SECRET_KEY from .env if present
+// Read PAYSTACK_SECRET_KEY from .env in project root
 let paystackSecret = 'test_secret_fallback';
 try {
-  const envContent = fs.readFileSync(path.join(__dirname, '.env'), 'utf-8');
+  const envPath = path.resolve(__dirname, '..', '.env');
+  const envContent = fs.readFileSync(envPath, 'utf-8');
   const match = envContent.match(/PAYSTACK_SECRET_KEY=(.*)/);
   if (match && match[1]) {
     paystackSecret = match[1].trim();
@@ -103,7 +104,7 @@ async function runTest() {
       event: 'charge.success',
       data: {
         reference: reference,
-        amount: 20000 * 100, // 20,000 NGN in Kobo
+        amount: 20000 * 100,
       },
     });
 
@@ -118,7 +119,6 @@ async function runTest() {
       },
     });
 
-    // Check that funds are locked and job is IN_PROGRESS
     const lockedEscrow = await axios.get(`${API}/escrow/${escrow.id}`, {
       headers: { Authorization: `Bearer ${clientToken}` },
     });
@@ -126,7 +126,7 @@ async function runTest() {
     console.log(`   ✅ Funds locked! Escrow Status: ${lockedEscrow.data.totalStatus}`);
     console.log(`   ✅ Job synchronized! Job Status: ${updatedJob.data.status}`);
 
-    // 7. Client releases Tranche 1 (Mobilization)
+    // 7. Client releases Tranche 1
     console.log('7. Client releasing Tranche 1...');
     const tranche1Res = await axios.patch(
       `${API}/escrow/${escrow.id}/release-tranche1`,
