@@ -83,4 +83,12 @@ export class EscrowController {
       verifyDto.pin,
     );
   }
+
+  @Patch(':id/dispute')
+  dispute(
+    @Param('id') id: string,
+    @Request() req: AuthenticatedRequest,
+  ) {
+    return this.escrowService.dispute(id, req.user.userId);
+  }
 }

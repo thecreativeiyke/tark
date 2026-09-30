@@ -275,10 +275,21 @@ export class EscrowService {
     const escrow = await this.findOne(id);
 
     if (escrow.clientId !== userId && escrow.artisanId !== userId) {
-      throw new BadRequestException('Only the client or artisan can raise a dispute');
+      throw new BadRequestException('Only the assigned client or artisan can raise a dispute');
     }
 
+    if (escrow.totalStatus === EscrowStatus.SETTLED) {
+      throw new BadRequestException('Cannot dispute an already settled escrow');
+    }
+
+    if (escrow.totalStatus === EscrowStatus.INITIATED) {
+      throw new BadRequestException('Cannot dispute an unfunded escrow');
+    }
+
+    escrow.handshakePin = null;
+    escrow.handshakeExpiresAt = null;
     escrow.totalStatus = EscrowStatus.DISPUTED;
+
     await this.jobsService.updateStatus(escrow.jobId, JobStatus.DISPUTED);
     return this.escrowRepository.save(escrow);
   }

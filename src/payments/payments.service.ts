@@ -439,6 +439,9 @@ export class PaymentsService {
 
       const escrow = await this.escrowService.findByReference(reference);
       if (escrow) {
+        if (escrow.totalStatus === EscrowStatus.FUNDS_LOCKED || escrow.totalStatus === EscrowStatus.HANDSHAKE_PENDING || escrow.totalStatus === EscrowStatus.SETTLED) {
+          return { status: 'success', message: 'Escrow already funded (idempotent)' };
+        }
         await this.escrowService.lockFunds(escrow.id);
         return { status: 'success', message: 'Escrow funded via online checkout' };
       }
