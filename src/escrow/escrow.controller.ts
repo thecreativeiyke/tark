@@ -3,26 +3,26 @@ import {
   Get,
   Post,
   Body,
-  Param,
   Patch,
+  Param,
   UseGuards,
   Request,
 } from '@nestjs/common';
 import { EscrowService } from './escrow.service';
 import { CreateEscrowDto } from './dto/create-escrow.dto';
-import { VerifyHandshakeDto } from './dto/verify-handshake.dto';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 
-interface AuthenticatedRequest extends Request {
+interface AuthenticatedRequest {
   user: {
     userId: string;
     email: string;
     role: string;
   };
+  [key: string]: any;
 }
 
-@UseGuards(JwtAuthGuard)
 @Controller('escrow')
+@UseGuards(JwtAuthGuard)
 export class EscrowController {
   constructor(private readonly escrowService: EscrowService) {}
 
@@ -69,14 +69,10 @@ export class EscrowController {
   @Patch(':id/verify-handshake')
   verifyHandshake(
     @Param('id') id: string,
-    @Body() verifyHandshakeDto: VerifyHandshakeDto,
+    @Body('pin') pin: string,
     @Request() req: AuthenticatedRequest,
   ) {
-    return this.escrowService.verifyHandshake(
-      id,
-      verifyHandshakeDto.pin,
-      req.user.userId,
-    );
+    return this.escrowService.verifyHandshake(id, req.user.userId, pin);
   }
 
   @Patch(':id/settle')
