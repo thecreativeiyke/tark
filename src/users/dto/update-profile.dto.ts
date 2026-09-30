@@ -21,4 +21,26 @@ export class UpdateProfileDto {
   @IsOptional()
   @IsNumber()
   longitude?: number;
+
+  // KYC
+  @IsOptional()
+  @IsString()
+  idType?: string;
+
+  @IsOptional()
+  @IsString()
+  idNumber?: string;
+
+  // Payout Configuration
+  @IsOptional()
+  @IsString()
+  payoutProvider?: string;
+
+  @IsOptional()
+  @IsString()
+  payoutAccountIdentifier?: string;
+
+  @IsOptional()
+  @IsString()
+  payoutBankOrNetwork?: string;
 }

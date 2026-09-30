@@ -6,12 +6,6 @@ import {
   UpdateDateColumn,
 } from 'typeorm';
 
-export enum TrancheStatus {
-  PENDING = 'PENDING',
-  LOCKED = 'LOCKED',
-  RELEASED = 'RELEASED',
-}
-
 export enum EscrowStatus {
   INITIATED = 'INITIATED',
   FUNDS_LOCKED = 'FUNDS_LOCKED',
@@ -19,6 +13,13 @@ export enum EscrowStatus {
   HANDSHAKE_PENDING = 'HANDSHAKE_PENDING',
   SETTLED = 'SETTLED',
   DISPUTED = 'DISPUTED',
+}
+
+export enum TrancheStatus {
+  PENDING = 'PENDING',
+  LOCKED = 'LOCKED',
+  RELEASED = 'RELEASED',
+  REFUNDED = 'REFUNDED',
 }
 
 @Entity()
@@ -34,6 +35,9 @@ export class EscrowTransaction {
 
   @Column({ nullable: true })
   artisanId: string;
+
+  @Column({ default: 'NGN' })
+  currency: string;
 
   @Column({ type: 'decimal', precision: 10, scale: 2 })
   tranche1Amount: number;
@@ -62,10 +66,10 @@ export class EscrowTransaction {
   })
   totalStatus: EscrowStatus;
 
-  @Column({ nullable: true, unique: true })
+  @Column({ nullable: true })
   paystackReference: string;
 
-  @Column({ type: 'varchar', length: 6, nullable: true })
+  @Column({ nullable: true, length: 6 })
   handshakePin: string | null;
 
   @Column({ type: 'timestamp', nullable: true })

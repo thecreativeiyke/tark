@@ -8,6 +8,10 @@ export class CreateEscrowDto {
   @IsString()
   artisanId?: string;
 
+  @IsOptional()
+  @IsString()
+  currency?: string;
+
   @IsNumber()
   @Min(0)
   tranche1Amount: number;

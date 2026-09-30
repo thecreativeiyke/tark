@@ -16,6 +16,10 @@ export class CreateJobDto {
   @IsString()
   category: string;
 
+  @IsOptional()
+  @IsString()
+  currency?: string;
+
   @IsNumber()
   @Min(0)
   budget: number;

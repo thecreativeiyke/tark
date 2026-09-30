@@ -29,6 +29,9 @@ export class Job {
   @Column()
   category: string;
 
+  @Column({ default: 'NGN' })
+  currency: string;
+
   @Column({ type: 'decimal', precision: 10, scale: 2 })
   budget: number;
 
