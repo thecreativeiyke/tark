@@ -69,7 +69,7 @@ export class EscrowTransaction {
   @Column({ nullable: true })
   paystackReference: string;
 
-  @Column({ nullable: true, length: 6 })
+  @Column({ type: 'varchar', length: 6, nullable: true })
   handshakePin: string | null;
 
   @Column({ type: 'timestamp', nullable: true })
