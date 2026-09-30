@@ -39,6 +39,18 @@ export class PaymentsController {
   }
 
   @UseGuards(JwtAuthGuard)
+  @Post('fund-with-wallet')
+  fundWithWallet(
+    @Body('escrowId') escrowId: string,
+    @Request() req: AuthenticatedRequest,
+  ) {
+    if (!escrowId) {
+      throw new BadRequestException('escrowId is required');
+    }
+    return this.paymentsService.fundEscrowWithWallet(escrowId, req.user.userId);
+  }
+
+  @UseGuards(JwtAuthGuard)
   @Get('bank/resolve')
   resolveBank(
     @Query('accountNumber') accountNumber: string,

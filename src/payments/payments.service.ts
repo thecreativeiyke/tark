@@ -11,6 +11,7 @@ import { Repository } from 'typeorm';
 import axios from 'axios';
 import * as crypto from 'crypto';
 import { EscrowService } from '../escrow/escrow.service';
+import { EscrowStatus } from '../escrow/entities/escrow-transaction.entity';
 import { User } from '../users/entities/user.entity';
 
 @Injectable()
@@ -66,6 +67,46 @@ export class PaymentsService {
     }
   }
 
+  async fundEscrowWithWallet(escrowId: string, userId: string) {
+    const escrow = await this.escrowService.findOne(escrowId);
+
+    if (escrow.clientId !== userId) {
+      throw new BadRequestException('Only the client who created this escrow can fund it');
+    }
+
+    if (escrow.totalStatus !== EscrowStatus.INITIATED) {
+      throw new BadRequestException(`Escrow is already ${escrow.totalStatus}`);
+    }
+
+    const totalAmount = Number(escrow.tranche1Amount) + Number(escrow.tranche2Amount);
+    const user = await this.usersRepository.findOneBy({ id: userId });
+
+    if (!user) {
+      throw new NotFoundException('User not found');
+    }
+
+    const currentBalance = Number(user.walletBalance || 0);
+    if (currentBalance < totalAmount) {
+      throw new BadRequestException(
+        `Insufficient wallet balance. Required: NGN ${totalAmount}, Available: NGN ${currentBalance}`,
+      );
+    }
+
+    // Deduct total budget from user's wallet
+    user.walletBalance = parseFloat((currentBalance - totalAmount).toFixed(2));
+    await this.usersRepository.save(user);
+
+    // Transition Escrow to FUNDS_LOCKED and Job to IN_PROGRESS
+    const lockedEscrow = await this.escrowService.lockFunds(escrow.id);
+
+    return {
+      message: 'Escrow funded successfully from wallet',
+      deductedAmount: totalAmount,
+      remainingBalance: user.walletBalance,
+      escrow: lockedEscrow,
+    };
+  }
+
   async resolveBankAccount(accountNumber: string, bankCode: string) {
     try {
       const response = await axios.get(
@@ -113,7 +154,6 @@ export class PaymentsService {
       };
     }
 
-    // 1. Create Paystack Customer if not present
     let customerCode = user.paystackCustomerCode;
     if (!customerCode) {
       try {
@@ -133,14 +173,12 @@ export class PaymentsService {
         await this.usersRepository.save(user);
       } catch (err: any) {
         this.logger.error('Failed to create Paystack customer', err?.response?.data || err.message);
-        // Fallback for offline/test environments
         customerCode = `CUS_${Date.now()}`;
         user.paystackCustomerCode = customerCode;
         await this.usersRepository.save(user);
       }
     }
 
-    // 2. Request Paystack Dedicated Account (DVA)
     try {
       const dvaRes = await axios.post(
         `${this.paystackBaseUrl}/dedicated_account`,
@@ -159,7 +197,6 @@ export class PaymentsService {
       this.logger.warn(
         `Paystack DVA live provision unavailable (${error?.response?.data?.message || error.message}). Activating Sandbox DVA.`,
       );
-      // Sandbox fallback so local development and transfers work cleanly
       user.virtualAccountNumber = `96${Math.floor(10000000 + Math.random() * 90000000)}`;
       user.virtualBankName = 'Paystack-Titan (Sandbox)';
       await this.usersRepository.save(user);
@@ -206,14 +243,12 @@ export class PaymentsService {
       const reference = event.data?.reference;
       const customerCode = event.data?.customer?.customer_code;
 
-      // Case A: Direct Escrow Checkout Funding
       const escrow = await this.escrowService.findByReference(reference);
       if (escrow) {
         await this.escrowService.lockFunds(escrow.id);
         return { status: 'success', message: 'Escrow funded via Paystack checkout' };
       }
 
-      // Case B: DVA Inbound Transfer -> In-App Wallet Credit
       if (customerCode) {
         const user = await this.usersRepository.findOneBy({ paystackCustomerCode: customerCode });
         if (user) {
