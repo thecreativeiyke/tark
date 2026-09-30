@@ -1,7 +1,11 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import {
+  Injectable,
+  NotFoundException,
+  ForbiddenException,
+} from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
-import { Job } from './entities/job.entity';
+import { Job, JobStatus } from './entities/job.entity';
 import { CreateJobDto } from './dto/create-job.dto';
 import { UpdateJobDto } from './dto/update-job.dto';
 
@@ -13,11 +17,16 @@ export class JobsService {
   ) {}
 
   create(createJobDto: CreateJobDto, clientId: string) {
-    const job = this.jobsRepository.create({ ...createJobDto, clientId });
+    const job = this.jobsRepository.create({
+      ...createJobDto,
+      clientId,
+      status: JobStatus.OPEN,
+    });
     return this.jobsRepository.save(job);
   }
 
   findAll() {
+    // Automatically excludes soft-deleted (archived) jobs
     return this.jobsRepository.find();
   }
 
@@ -29,14 +38,35 @@ export class JobsService {
     return job;
   }
 
-  async update(id: string, updateJobDto: UpdateJobDto) {
+  async update(id: string, updateJobDto: UpdateJobDto, userId: string) {
     const job = await this.findOne(id);
+    if (job.clientId !== userId) {
+      throw new ForbiddenException('You do not have permission to update this job');
+    }
     Object.assign(job, updateJobDto);
     return this.jobsRepository.save(job);
   }
 
-  async remove(id: string) {
+  async remove(id: string, userId: string) {
     const job = await this.findOne(id);
-    return this.jobsRepository.remove(job);
+    if (job.clientId !== userId) {
+      throw new ForbiddenException('You do not have permission to archive this job');
+    }
+    job.status = JobStatus.CANCELLED;
+    await this.jobsRepository.save(job);
+    await this.jobsRepository.softDelete(id);
+    return { archived: true, id };
+  }
+
+  async updateStatus(id: string, status: JobStatus) {
+    const job = await this.findOne(id);
+    job.status = status;
+    return this.jobsRepository.save(job);
+  }
+
+  async assignArtisan(jobId: string, artisanId: string) {
+    const job = await this.findOne(jobId);
+    job.artisanId = artisanId;
+    return this.jobsRepository.save(job);
   }
 }

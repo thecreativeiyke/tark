@@ -10,6 +10,7 @@ import {
 } from '@nestjs/common';
 import { EscrowService } from './escrow.service';
 import { CreateEscrowDto } from './dto/create-escrow.dto';
+import { VerifyHandshakeDto } from './dto/verify-handshake.dto';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 
 interface AuthenticatedRequest extends Request {
@@ -33,38 +34,64 @@ export class EscrowController {
     return this.escrowService.create(createEscrowDto, req.user.userId);
   }
 
-  @Get(':id')
-  findOne(@Param('id') id: string) {
-    return this.escrowService.findOne(id);
-  }
-
   @Get('job/:jobId')
-  findByJob(@Param('jobId') jobId: string) {
-    return this.escrowService.findByJob(jobId);
+  findByJob(
+    @Param('jobId') jobId: string,
+    @Request() req: AuthenticatedRequest,
+  ) {
+    return this.escrowService.findByJobForUser(jobId, req.user.userId);
   }
 
-  @Patch(':id/lock-funds')
-  lockFunds(@Param('id') id: string) {
-    return this.escrowService.lockFunds(id);
+  @Get(':id')
+  findOne(
+    @Param('id') id: string,
+    @Request() req: AuthenticatedRequest,
+  ) {
+    return this.escrowService.findOneForUser(id, req.user.userId);
   }
 
   @Patch(':id/release-tranche1')
-  releaseTranche1(@Param('id') id: string) {
-    return this.escrowService.releaseTranche1(id);
+  releaseTranche1(
+    @Param('id') id: string,
+    @Request() req: AuthenticatedRequest,
+  ) {
+    return this.escrowService.releaseTranche1(id, req.user.userId);
   }
 
   @Patch(':id/initiate-handshake')
-  initiateHandshake(@Param('id') id: string) {
-    return this.escrowService.initiateHandshake(id);
+  initiateHandshake(
+    @Param('id') id: string,
+    @Request() req: AuthenticatedRequest,
+  ) {
+    return this.escrowService.initiateHandshake(id, req.user.userId);
+  }
+
+  @Patch(':id/verify-handshake')
+  verifyHandshake(
+    @Param('id') id: string,
+    @Body() verifyHandshakeDto: VerifyHandshakeDto,
+    @Request() req: AuthenticatedRequest,
+  ) {
+    return this.escrowService.verifyHandshake(
+      id,
+      verifyHandshakeDto.pin,
+      req.user.userId,
+    );
   }
 
   @Patch(':id/settle')
-  settle(@Param('id') id: string) {
-    return this.escrowService.settle(id);
+  settle(
+    @Param('id') id: string,
+    @Request() req: AuthenticatedRequest,
+  ) {
+    return this.escrowService.settle(id, req.user.userId);
   }
 
   @Patch(':id/dispute')
-  dispute(@Param('id') id: string) {
-    return this.escrowService.dispute(id);
+  dispute(
+    @Param('id') id: string,
+    @Request() req: AuthenticatedRequest,
+  ) {
+    return this.escrowService.dispute(id, req.user.userId);
   }
 }

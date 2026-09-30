@@ -1,8 +1,12 @@
-import { IsString, IsNumber, Min } from 'class-validator';
+import { IsString, IsNumber, Min, IsOptional } from 'class-validator';
 
 export class CreateEscrowDto {
   @IsString()
   jobId: string;
+
+  @IsOptional()
+  @IsString()
+  artisanId?: string;
 
   @IsNumber()
   @Min(0)

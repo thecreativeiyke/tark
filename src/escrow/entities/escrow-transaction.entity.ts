@@ -62,6 +62,15 @@ export class EscrowTransaction {
   })
   totalStatus: EscrowStatus;
 
+  @Column({ nullable: true, unique: true })
+  paystackReference: string;
+
+  @Column({ type: 'varchar', length: 6, nullable: true })
+  handshakePin: string | null;
+
+  @Column({ type: 'timestamp', nullable: true })
+  handshakeExpiresAt: Date | null;
+
   @CreateDateColumn()
   createdAt: Date;
 

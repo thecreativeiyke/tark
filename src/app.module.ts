@@ -7,6 +7,7 @@ import { JobsModule } from './jobs/jobs.module';
 import { UsersModule } from './users/users.module';
 import { AuthModule } from './auth/auth.module';
 import { EscrowModule } from './escrow/escrow.module';
+import { PaymentsModule } from './payments/payments.module';
 
 @Module({
   imports: [
@@ -31,6 +32,7 @@ import { EscrowModule } from './escrow/escrow.module';
     UsersModule,
     AuthModule,
     EscrowModule,
+    PaymentsModule,
   ],
   controllers: [AppController],
   providers: [AppService],

@@ -4,7 +4,16 @@ import {
   PrimaryGeneratedColumn,
   CreateDateColumn,
   UpdateDateColumn,
+  DeleteDateColumn,
 } from 'typeorm';
+
+export enum JobStatus {
+  OPEN = 'OPEN',
+  IN_PROGRESS = 'IN_PROGRESS',
+  COMPLETED = 'COMPLETED',
+  DISPUTED = 'DISPUTED',
+  CANCELLED = 'CANCELLED',
+}
 
 @Entity()
 export class Job {
@@ -32,8 +41,12 @@ export class Job {
   @Column()
   location: string;
 
-  @Column({ default: 'INITIATED' })
-  status: string;
+  @Column({
+    type: 'enum',
+    enum: JobStatus,
+    default: JobStatus.OPEN,
+  })
+  status: JobStatus;
 
   @Column()
   clientId: string;
@@ -49,4 +62,7 @@ export class Job {
 
   @UpdateDateColumn()
   updatedAt: Date;
+
+  @DeleteDateColumn()
+  deletedAt: Date | null;
 }
