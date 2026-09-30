@@ -34,6 +34,14 @@ export class CreateJobDto {
   location: string;
 
   @IsOptional()
+  @IsNumber()
+  latitude?: number;
+
+  @IsOptional()
+  @IsNumber()
+  longitude?: number;
+
+  @IsOptional()
   @IsArray()
   @IsString({ each: true })
   mediaUrls?: string[];

@@ -41,6 +41,12 @@ export class Job {
   @Column()
   location: string;
 
+  @Column({ type: 'double precision', nullable: true })
+  latitude: number;
+
+  @Column({ type: 'double precision', nullable: true })
+  longitude: number;
+
   @Column({
     type: 'enum',
     enum: JobStatus,

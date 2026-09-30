@@ -25,8 +25,23 @@ export class User {
   @Column()
   fullName: string;
 
+  @Column({ nullable: true })
+  phoneNumber: string;
+
   @Column({ type: 'enum', enum: UserRole, default: UserRole.CLIENT })
   role: UserRole;
+
+  @Column({ default: false })
+  isVerified: boolean;
+
+  @Column('text', { array: true, default: '{}' })
+  skills: string[];
+
+  @Column({ type: 'double precision', nullable: true })
+  latitude: number;
+
+  @Column({ type: 'double precision', nullable: true })
+  longitude: number;
 
   @CreateDateColumn()
   createdAt: Date;

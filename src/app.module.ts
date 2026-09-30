@@ -8,6 +8,7 @@ import { UsersModule } from './users/users.module';
 import { AuthModule } from './auth/auth.module';
 import { EscrowModule } from './escrow/escrow.module';
 import { PaymentsModule } from './payments/payments.module';
+import { CategoriesModule } from './categories/categories.module';
 
 @Module({
   imports: [
@@ -33,6 +34,7 @@ import { PaymentsModule } from './payments/payments.module';
     AuthModule,
     EscrowModule,
     PaymentsModule,
+    CategoriesModule,
   ],
   controllers: [AppController],
   providers: [AppService],
