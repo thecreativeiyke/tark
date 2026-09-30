@@ -1,3 +1,5 @@
+import { BidsModule } from './bids/bids.module';
+import { Bid } from './bids/entities/bid.entity';
 import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
@@ -12,12 +14,11 @@ import { PaymentsModule } from './payments/payments.module';
 import { MediaModule } from './media/media.module';
 
 @Module({
-  imports: [
-    ConfigModule.forRoot({
+  imports: [ConfigModule.forRoot({
       isGlobal: true,
     }),
     TypeOrmModule.forRootAsync({
-      imports: [ConfigModule],
+      imports: [ConfigModule, BidsModule],
       useFactory: (configService: ConfigService) => {
         const databaseUrl = configService.get<string>('DATABASE_URL');
 
