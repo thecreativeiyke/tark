@@ -213,15 +213,17 @@ export class EscrowService {
       throw new BadRequestException('Invalid Handshake PIN');
     }
 
-    // Automated payout for Tranche 2
+    // Automated payout: Disburse Tranche 2 + any unreleased Tranche 1
     if (escrow.artisanId) {
       const artisan = await this.usersRepository.findOneBy({ id: escrow.artisanId });
       if (artisan?.payoutRecipientCode) {
-        const amountKobo = Math.round(Number(escrow.tranche2Amount) * 100);
+        const tr1Remaining = escrow.tranche1Status === TrancheStatus.RELEASED ? 0 : Number(escrow.tranche1Amount);
+        const payoutTotal = tr1Remaining + Number(escrow.tranche2Amount);
+        const amountKobo = Math.round(payoutTotal * 100);
         await this.paymentsService.initiateTransfer(
           amountKobo,
           artisan.payoutRecipientCode,
-          `Tark Payout: Tranche 2 for Job #${escrow.jobId.slice(0, 8)}`,
+          `Tark Payout: Settlement for Job #${escrow.jobId.slice(0, 8)}`,
         );
       }
     }
