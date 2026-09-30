@@ -69,6 +69,9 @@ export class EscrowTransaction {
   @Column({ nullable: true })
   paystackReference: string;
 
+  @Column('text', { array: true, nullable: true })
+  proofOfWorkUrls: string[];
+
   @Column({ type: 'varchar', length: 6, nullable: true })
   handshakePin: string | null;
 

@@ -144,7 +144,7 @@ export class EscrowService {
     return this.escrowRepository.save(escrow);
   }
 
-  async initiateHandshake(id: string, artisanId: string) {
+  async initiateHandshake(id: string, artisanId: string, proofOfWorkUrls?: string[]) {
     const escrow = await this.findOne(id);
 
     if (escrow.artisanId && escrow.artisanId !== artisanId) {
@@ -164,6 +164,9 @@ export class EscrowService {
     escrow.handshakePin = pin;
     escrow.handshakeExpiresAt = expiresAt;
     escrow.totalStatus = EscrowStatus.HANDSHAKE_PENDING;
+    if (proofOfWorkUrls && proofOfWorkUrls.length > 0) {
+      escrow.proofOfWorkUrls = proofOfWorkUrls;
+    }
 
     await this.escrowRepository.save(escrow);
     this.logger.log(`Handshake PIN [${pin}] generated for Escrow #${escrow.id}.`);
