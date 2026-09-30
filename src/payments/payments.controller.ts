@@ -63,6 +63,19 @@ export class PaymentsController {
   }
 
   @UseGuards(JwtAuthGuard)
+  @Post('bank/save')
+  saveBank(
+    @Body('accountNumber') accountNumber: string,
+    @Body('bankCode') bankCode: string,
+    @Request() req: AuthenticatedRequest,
+  ) {
+    if (!accountNumber || !bankCode) {
+      throw new BadRequestException('accountNumber and bankCode are required');
+    }
+    return this.paymentsService.saveArtisanBank(req.user.userId, accountNumber, bankCode);
+  }
+
+  @UseGuards(JwtAuthGuard)
   @Post('dedicated-account')
   assignDedicatedAccount(@Request() req: AuthenticatedRequest) {
     return this.paymentsService.assignDedicatedVirtualAccount(req.user.userId);

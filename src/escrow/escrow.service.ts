@@ -2,7 +2,9 @@ import {
   Injectable,
   NotFoundException,
   BadRequestException,
-  ForbiddenException,
+  Logger,
+  Inject,
+  forwardRef,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
@@ -14,54 +16,45 @@ import {
 import { CreateEscrowDto } from './dto/create-escrow.dto';
 import { JobsService } from '../jobs/jobs.service';
 import { JobStatus } from '../jobs/entities/job.entity';
-
-const ALLOWED_TRANSITIONS: Record<EscrowStatus, EscrowStatus[]> = {
-  [EscrowStatus.INITIATED]: [EscrowStatus.FUNDS_LOCKED],
-  [EscrowStatus.FUNDS_LOCKED]: [
-    EscrowStatus.TRANCHE_1_RELEASED,
-    EscrowStatus.DISPUTED,
-  ],
-  [EscrowStatus.TRANCHE_1_RELEASED]: [
-    EscrowStatus.HANDSHAKE_PENDING,
-    EscrowStatus.DISPUTED,
-  ],
-  [EscrowStatus.HANDSHAKE_PENDING]: [
-    EscrowStatus.SETTLED,
-    EscrowStatus.DISPUTED,
-  ],
-  [EscrowStatus.SETTLED]: [],
-  [EscrowStatus.DISPUTED]: [],
-};
+import { User } from '../users/entities/user.entity';
+import { PaymentsService } from '../payments/payments.service';
 
 @Injectable()
 export class EscrowService {
+  private readonly logger = new Logger(EscrowService.name);
+
   constructor(
     @InjectRepository(EscrowTransaction)
     private escrowRepository: Repository<EscrowTransaction>,
+    @InjectRepository(User)
+    private usersRepository: Repository<User>,
     private jobsService: JobsService,
+    @Inject(forwardRef(() => PaymentsService))
+    private paymentsService: PaymentsService,
   ) {}
 
   async create(createEscrowDto: CreateEscrowDto, clientId: string) {
+    const job = await this.jobsService.findOne(createEscrowDto.jobId);
+    if (!job) {
+      throw new NotFoundException('Job not found');
+    }
+
     const escrow = this.escrowRepository.create({
       ...createEscrowDto,
       clientId,
+      artisanId: createEscrowDto.artisanId || job.artisanId,
+      totalStatus: EscrowStatus.INITIATED,
+      tranche1Status: TrancheStatus.PENDING,
+      tranche2Status: TrancheStatus.PENDING,
     });
-    const saved = await this.escrowRepository.save(escrow);
 
-    if (createEscrowDto.artisanId) {
-      await this.jobsService.assignArtisan(
-        createEscrowDto.jobId,
-        createEscrowDto.artisanId,
-      );
-    }
-
-    return saved;
+    return this.escrowRepository.save(escrow);
   }
 
   async findOne(id: string) {
     const escrow = await this.escrowRepository.findOneBy({ id });
     if (!escrow) {
-      throw new NotFoundException(`Escrow transaction ${id} not found`);
+      throw new NotFoundException('Escrow transaction not found');
     }
     return escrow;
   }
@@ -69,34 +62,35 @@ export class EscrowService {
   async findOneForUser(id: string, userId: string) {
     const escrow = await this.findOne(id);
     if (escrow.clientId !== userId && escrow.artisanId !== userId) {
-      throw new ForbiddenException(
-        'You do not have permission to view this escrow',
-      );
+      throw new BadRequestException('Unauthorized access to escrow transaction');
     }
-    return this.sanitizeForUser(escrow, userId);
+    // Security: Mask handshake PIN from artisan so client must verbally or digitally provide it
+    if (escrow.artisanId === userId && escrow.totalStatus === EscrowStatus.HANDSHAKE_PENDING) {
+      return { ...escrow, handshakePin: null };
+    }
+    return escrow;
   }
 
-  async findByJob(jobId: string) {
+  async findByJobId(jobId: string) {
     return this.escrowRepository.findOneBy({ jobId });
   }
 
   async findByJobForUser(jobId: string, userId: string) {
-    const escrow = await this.findByJob(jobId);
+    const escrow = await this.findByJobId(jobId);
     if (!escrow) {
-      throw new NotFoundException(
-        `Escrow transaction for job ${jobId} not found`,
-      );
+      return null;
     }
     if (escrow.clientId !== userId && escrow.artisanId !== userId) {
-      throw new ForbiddenException(
-        'You do not have permission to view this escrow',
-      );
+      throw new BadRequestException('Unauthorized access to escrow transaction');
     }
-    return this.sanitizeForUser(escrow, userId);
+    if (escrow.artisanId === userId && escrow.totalStatus === EscrowStatus.HANDSHAKE_PENDING) {
+      return { ...escrow, handshakePin: null };
+    }
+    return escrow;
   }
 
-  findByReference(reference: string) {
-    return this.escrowRepository.findOneBy({ paystackReference: reference });
+  async findByReference(paystackReference: string) {
+    return this.escrowRepository.findOneBy({ paystackReference });
   }
 
   async attachPaystackReference(id: string, reference: string) {
@@ -105,149 +99,170 @@ export class EscrowService {
     return this.escrowRepository.save(escrow);
   }
 
-  private assertTransition(current: EscrowStatus, target: EscrowStatus) {
-    const allowed = ALLOWED_TRANSITIONS[current];
-    if (!allowed.includes(target)) {
-      throw new BadRequestException(
-        `Cannot move escrow from ${current} to ${target}`,
-      );
-    }
-  }
-
-  private sanitizeForUser(
-    escrow: EscrowTransaction,
-    userId: string,
-  ): EscrowTransaction {
-    if (escrow.clientId !== userId) {
-      const sanitized = { ...escrow };
-      sanitized.handshakePin = null;
-      return sanitized as EscrowTransaction;
-    }
-    return escrow;
-  }
-
   async lockFunds(id: string) {
     const escrow = await this.findOne(id);
-    this.assertTransition(escrow.totalStatus, EscrowStatus.FUNDS_LOCKED);
+
+    if (escrow.totalStatus !== EscrowStatus.INITIATED) {
+      throw new BadRequestException('Funds can only be locked from INITIATED status');
+    }
+
+    escrow.totalStatus = EscrowStatus.FUNDS_LOCKED;
     escrow.tranche1Status = TrancheStatus.LOCKED;
     escrow.tranche2Status = TrancheStatus.LOCKED;
-    escrow.totalStatus = EscrowStatus.FUNDS_LOCKED;
-    const saved = await this.escrowRepository.save(escrow);
 
-    // Job transitions to IN_PROGRESS now that payment is confirmed
     await this.jobsService.updateStatus(escrow.jobId, JobStatus.IN_PROGRESS);
-
-    return saved;
-  }
-
-  async releaseTranche1(id: string, userId: string) {
-    const escrow = await this.findOne(id);
-    if (escrow.clientId !== userId) {
-      throw new ForbiddenException(
-        'Only the paying client can release Tranche 1',
-      );
-    }
-    this.assertTransition(
-      escrow.totalStatus,
-      EscrowStatus.TRANCHE_1_RELEASED,
-    );
-    escrow.tranche1Status = TrancheStatus.RELEASED;
-    escrow.totalStatus = EscrowStatus.TRANCHE_1_RELEASED;
     return this.escrowRepository.save(escrow);
   }
 
-  async initiateHandshake(id: string, userId: string) {
+  async releaseTranche1(id: string, clientId: string) {
     const escrow = await this.findOne(id);
-    if (escrow.clientId !== userId && escrow.artisanId !== userId) {
-      throw new ForbiddenException(
-        'Only the assigned client or artisan can initiate the handshake',
-      );
+
+    if (escrow.clientId !== clientId) {
+      throw new BadRequestException('Only the client can release Tranche 1');
     }
-    this.assertTransition(
-      escrow.totalStatus,
-      EscrowStatus.HANDSHAKE_PENDING,
-    );
 
-    const generatedPin = Math.floor(100000 + Math.random() * 900000).toString();
+    if (escrow.tranche1Status !== TrancheStatus.LOCKED) {
+      throw new BadRequestException('Tranche 1 is not locked or has already been released');
+    }
 
-    escrow.handshakePin = generatedPin;
-    escrow.handshakeExpiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
-    escrow.totalStatus = EscrowStatus.HANDSHAKE_PENDING;
+    // Execute automated payout if artisan has registered payout details
+    if (escrow.artisanId) {
+      const artisan = await this.usersRepository.findOneBy({ id: escrow.artisanId });
+      if (artisan?.payoutRecipientCode) {
+        const amountKobo = Math.round(Number(escrow.tranche1Amount) * 100);
+        await this.paymentsService.initiateTransfer(
+          amountKobo,
+          artisan.payoutRecipientCode,
+          `Tark Payout: Tranche 1 for Job #${escrow.jobId.slice(0, 8)}`,
+        );
+      }
+    }
 
-    const saved = await this.escrowRepository.save(escrow);
-    return this.sanitizeForUser(saved, userId);
+    escrow.tranche1Status = TrancheStatus.RELEASED;
+    escrow.totalStatus = EscrowStatus.TRANCHE_1_RELEASED;
+
+    return this.escrowRepository.save(escrow);
   }
 
-  async verifyHandshake(id: string, pin: string, userId: string) {
+  async initiateHandshake(id: string, artisanId: string) {
     const escrow = await this.findOne(id);
 
-    if (escrow.artisanId && escrow.artisanId !== userId) {
-      throw new ForbiddenException(
-        'Only the assigned artisan can verify this handshake',
-      );
+    if (escrow.artisanId && escrow.artisanId !== artisanId) {
+      throw new BadRequestException('Only the assigned artisan can initiate handshake');
+    }
+
+    if (
+      escrow.totalStatus !== EscrowStatus.FUNDS_LOCKED &&
+      escrow.totalStatus !== EscrowStatus.TRANCHE_1_RELEASED
+    ) {
+      throw new BadRequestException('Cannot initiate completion handshake at this stage');
+    }
+
+    const pin = Math.floor(100000 + Math.random() * 900000).toString();
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
+
+    escrow.handshakePin = pin;
+    escrow.handshakeExpiresAt = expiresAt;
+    escrow.totalStatus = EscrowStatus.HANDSHAKE_PENDING;
+
+    await this.escrowRepository.save(escrow);
+    this.logger.log(`Handshake PIN [${pin}] generated for Escrow #${escrow.id}.`);
+
+    return {
+      message: 'Handshake initiated. Client has received the 6-digit confirmation PIN.',
+      expiresAt,
+    };
+  }
+
+  async verifyHandshake(id: string, artisanId: string, pin: string) {
+    const escrow = await this.findOne(id);
+
+    if (escrow.artisanId && escrow.artisanId !== artisanId) {
+      throw new BadRequestException('Only the assigned artisan can verify the handshake PIN');
     }
 
     if (escrow.totalStatus !== EscrowStatus.HANDSHAKE_PENDING) {
-      throw new BadRequestException(
-        `Handshake is not pending. Current status: ${escrow.totalStatus}`,
-      );
+      throw new BadRequestException('No pending handshake verification for this escrow');
     }
 
-    if (escrow.handshakeExpiresAt && new Date() > escrow.handshakeExpiresAt) {
-      throw new BadRequestException(
-        'Handshake PIN has expired. Please initiate a new handshake.',
-      );
+    if (!escrow.handshakePin || !escrow.handshakeExpiresAt) {
+      throw new BadRequestException('Handshake PIN not found');
+    }
+
+    if (new Date() > escrow.handshakeExpiresAt) {
+      throw new BadRequestException('Handshake PIN has expired. Please initiate a new one.');
     }
 
     if (escrow.handshakePin !== pin) {
-      throw new BadRequestException('Invalid handshake PIN');
+      throw new BadRequestException('Invalid Handshake PIN');
     }
 
-    this.assertTransition(escrow.totalStatus, EscrowStatus.SETTLED);
+    // Automated payout for Tranche 2
+    if (escrow.artisanId) {
+      const artisan = await this.usersRepository.findOneBy({ id: escrow.artisanId });
+      if (artisan?.payoutRecipientCode) {
+        const amountKobo = Math.round(Number(escrow.tranche2Amount) * 100);
+        await this.paymentsService.initiateTransfer(
+          amountKobo,
+          artisan.payoutRecipientCode,
+          `Tark Payout: Tranche 2 for Job #${escrow.jobId.slice(0, 8)}`,
+        );
+      }
+    }
 
     escrow.tranche2Status = TrancheStatus.RELEASED;
     escrow.totalStatus = EscrowStatus.SETTLED;
     escrow.handshakePin = null;
     escrow.handshakeExpiresAt = null;
 
-    const saved = await this.escrowRepository.save(escrow);
-
-    // Job is officially completed
     await this.jobsService.updateStatus(escrow.jobId, JobStatus.COMPLETED);
-
-    return saved;
+    return this.escrowRepository.save(escrow);
   }
 
   async settle(id: string, userId: string) {
     const escrow = await this.findOne(id);
+
     if (escrow.clientId !== userId) {
-      throw new ForbiddenException(
-        'Only the paying client can confirm settlement directly',
-      );
+      throw new BadRequestException('Only the client can manually trigger settlement');
     }
-    this.assertTransition(escrow.totalStatus, EscrowStatus.SETTLED);
+
+    if (
+      escrow.totalStatus !== EscrowStatus.HANDSHAKE_PENDING &&
+      escrow.totalStatus !== EscrowStatus.TRANCHE_1_RELEASED
+    ) {
+      throw new BadRequestException('Escrow cannot be settled at this stage');
+    }
+
+    if (escrow.artisanId) {
+      const artisan = await this.usersRepository.findOneBy({ id: escrow.artisanId });
+      if (artisan?.payoutRecipientCode) {
+        const amountKobo = Math.round(Number(escrow.tranche2Amount) * 100);
+        await this.paymentsService.initiateTransfer(
+          amountKobo,
+          artisan.payoutRecipientCode,
+          `Tark Payout: Settlement for Job #${escrow.jobId.slice(0, 8)}`,
+        );
+      }
+    }
+
     escrow.tranche2Status = TrancheStatus.RELEASED;
     escrow.totalStatus = EscrowStatus.SETTLED;
     escrow.handshakePin = null;
     escrow.handshakeExpiresAt = null;
 
-    const saved = await this.escrowRepository.save(escrow);
     await this.jobsService.updateStatus(escrow.jobId, JobStatus.COMPLETED);
-    return saved;
+    return this.escrowRepository.save(escrow);
   }
 
   async dispute(id: string, userId: string) {
     const escrow = await this.findOne(id);
-    if (escrow.clientId !== userId && escrow.artisanId !== userId) {
-      throw new ForbiddenException(
-        'Only the client or assigned artisan can dispute this escrow',
-      );
-    }
-    this.assertTransition(escrow.totalStatus, EscrowStatus.DISPUTED);
-    escrow.totalStatus = EscrowStatus.DISPUTED;
 
-    const saved = await this.escrowRepository.save(escrow);
+    if (escrow.clientId !== userId && escrow.artisanId !== userId) {
+      throw new BadRequestException('Only the client or artisan can raise a dispute');
+    }
+
+    escrow.totalStatus = EscrowStatus.DISPUTED;
     await this.jobsService.updateStatus(escrow.jobId, JobStatus.DISPUTED);
-    return saved;
+    return this.escrowRepository.save(escrow);
   }
 }
