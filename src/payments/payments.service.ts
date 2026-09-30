@@ -1,166 +1,213 @@
 import {
   Injectable,
   BadRequestException,
-  UnauthorizedException,
-  ForbiddenException,
   InternalServerErrorException,
+  NotFoundException,
+  Logger,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository } from 'typeorm';
 import axios from 'axios';
 import * as crypto from 'crypto';
 import { EscrowService } from '../escrow/escrow.service';
-import { UsersService } from '../users/users.service';
-import { EscrowStatus } from '../escrow/entities/escrow-transaction.entity';
-
-interface PaystackInitializeResponse {
-  status: boolean;
-  message: string;
-  data: {
-    authorization_url: string;
-    access_code: string;
-    reference: string;
-  };
-}
+import { User } from '../users/entities/user.entity';
 
 @Injectable()
 export class PaymentsService {
+  private readonly logger = new Logger(PaymentsService.name);
+  private readonly paystackBaseUrl = 'https://api.paystack.co';
+
   constructor(
     private configService: ConfigService,
     private escrowService: EscrowService,
-    private usersService: UsersService,
+    @InjectRepository(User)
+    private usersRepository: Repository<User>,
   ) {}
 
-  async initialize(escrowId: string, userId: string) {
+  private getSecretKey(): string {
+    const key = this.configService.get<string>('PAYSTACK_SECRET_KEY');
+    if (!key) {
+      throw new InternalServerErrorException('PAYSTACK_SECRET_KEY not set');
+    }
+    return key;
+  }
+
+  private getHeaders() {
+    return {
+      Authorization: `Bearer ${this.getSecretKey()}`,
+      'Content-Type': 'application/json',
+    };
+  }
+
+  async initializePayment(escrowId: string, email: string) {
     const escrow = await this.escrowService.findOne(escrowId);
-
-    if (escrow.clientId !== userId) {
-      throw new ForbiddenException('You do not own this escrow transaction');
-    }
-
-    if (escrow.totalStatus !== EscrowStatus.INITIATED) {
-      throw new BadRequestException(
-        'Payment has already been initiated or completed for this escrow',
-      );
-    }
-
-    if (escrow.paystackReference) {
-      throw new BadRequestException(
-        'Payment already initialized for this escrow',
-      );
-    }
-
-    const user = await this.usersService.findOne(userId);
-    if (!user) {
-      throw new BadRequestException('User not found');
-    }
-
-    const totalAmount =
-      Number(escrow.tranche1Amount) + Number(escrow.tranche2Amount);
+    const totalAmount = Number(escrow.tranche1Amount) + Number(escrow.tranche2Amount);
     const amountInKobo = Math.round(totalAmount * 100);
     const reference = `tark-${escrow.id}-${Date.now()}`;
 
-    const secretKey = this.configService.get<string>('PAYSTACK_SECRET_KEY');
-
-    let response;
     try {
-      response = await axios.post<PaystackInitializeResponse>(
-        'https://api.paystack.co/transaction/initialize',
+      const response = await axios.post(
+        `${this.paystackBaseUrl}/transaction/initialize`,
         {
-          email: user.email,
+          email,
           amount: amountInKobo,
           reference,
+          metadata: { escrowId: escrow.id },
         },
+        { headers: this.getHeaders() },
+      );
+
+      await this.escrowService.attachPaystackReference(escrow.id, reference);
+      return response.data.data;
+    } catch (error: any) {
+      this.logger.error('Payment initialization failed', error?.response?.data || error.message);
+      throw new BadRequestException('Failed to initialize payment with Paystack');
+    }
+  }
+
+  async resolveBankAccount(accountNumber: string, bankCode: string) {
+    try {
+      const response = await axios.get(
+        `${this.paystackBaseUrl}/bank/resolve?account_number=${accountNumber}&bank_code=${bankCode}`,
+        { headers: this.getHeaders() },
+      );
+      return response.data.data;
+    } catch (error: any) {
+      this.logger.error('Bank resolution failed', error?.response?.data || error.message);
+      throw new BadRequestException('Could not resolve bank account details');
+    }
+  }
+
+  async createTransferRecipient(name: string, accountNumber: string, bankCode: string) {
+    try {
+      const response = await axios.post(
+        `${this.paystackBaseUrl}/transferrecipient`,
         {
-          headers: {
-            Authorization: `Bearer ${secretKey}`,
-            'Content-Type': 'application/json',
-          },
-          timeout: 15000,
+          type: 'nuban',
+          name,
+          account_number: accountNumber,
+          bank_code: bankCode,
+          currency: 'NGN',
         },
+        { headers: this.getHeaders() },
       );
-    } catch (error) {
-      if (axios.isAxiosError(error)) {
-        if (error.response) {
-          throw new BadRequestException(
-            `Paystack rejected the request: ${
-              error.response.data?.message ?? 'unknown reason'
-            }`,
-          );
-        }
-        throw new InternalServerErrorException(
-          `Could not reach Paystack: ${error.message}`,
+      return response.data.data.recipient_code;
+    } catch (error: any) {
+      this.logger.error('Recipient creation failed', error?.response?.data || error.message);
+      throw new BadRequestException('Failed to create transfer recipient on Paystack');
+    }
+  }
+
+  async assignDedicatedVirtualAccount(userId: string) {
+    const user = await this.usersRepository.findOneBy({ id: userId });
+    if (!user) {
+      throw new NotFoundException('User not found');
+    }
+
+    if (user.virtualAccountNumber) {
+      return {
+        accountNumber: user.virtualAccountNumber,
+        bankName: user.virtualBankName,
+        customerCode: user.paystackCustomerCode,
+      };
+    }
+
+    try {
+      let customerCode = user.paystackCustomerCode;
+      if (!customerCode) {
+        const [firstName, ...lastNameParts] = user.fullName.split(' ');
+        const customerRes = await axios.post(
+          `${this.paystackBaseUrl}/customer`,
+          {
+            email: user.email,
+            first_name: firstName,
+            last_name: lastNameParts.join(' ') || 'User',
+            phone: user.phoneNumber || undefined,
+          },
+          { headers: this.getHeaders() },
         );
+        customerCode = customerRes.data.data.customer_code;
+        user.paystackCustomerCode = customerCode;
+        await this.usersRepository.save(user);
       }
-      throw new InternalServerErrorException(
-        'Unexpected error while initializing payment',
+
+      const dvaRes = await axios.post(
+        `${this.paystackBaseUrl}/dedicated_account`,
+        {
+          customer: customerCode,
+          preferred_bank: 'wema-bank',
+        },
+        { headers: this.getHeaders() },
       );
+
+      const dvaData = dvaRes.data.data;
+      user.virtualAccountNumber = dvaData.account_number;
+      user.virtualBankName = dvaData.bank.name;
+      await this.usersRepository.save(user);
+
+      return {
+        accountNumber: user.virtualAccountNumber,
+        bankName: user.virtualBankName,
+        customerCode: user.paystackCustomerCode,
+      };
+    } catch (error: any) {
+      this.logger.error('DVA assignment failed', error?.response?.data || error.message);
+      throw new BadRequestException('Failed to generate dedicated virtual account');
     }
-
-    await this.escrowService.attachPaystackReference(escrow.id, reference);
-
-    return {
-      authorizationUrl: response.data.data.authorization_url,
-      reference,
-    };
   }
 
-  private verifySignature(rawBody: Buffer, signature: string): boolean {
-    const secretKey = this.configService.get<string>('PAYSTACK_SECRET_KEY');
-    if (!secretKey || !signature || !rawBody) {
-      return false;
+  async initiateTransfer(amountKobo: number, recipientCode: string, reason: string) {
+    try {
+      const response = await axios.post(
+        `${this.paystackBaseUrl}/transfer`,
+        {
+          source: 'balance',
+          amount: amountKobo,
+          recipient: recipientCode,
+          reason,
+        },
+        { headers: this.getHeaders() },
+      );
+      return response.data.data;
+    } catch (error: any) {
+      this.logger.error('Transfer payout failed', error?.response?.data || error.message);
+      throw new BadRequestException('Automated payout transfer failed');
     }
-    const expectedHash = crypto
-      .createHmac('sha512', secretKey)
-      .update(rawBody)
-      .digest('hex');
-
-    const expectedBuffer = Buffer.from(expectedHash, 'utf-8');
-    const signatureBuffer = Buffer.from(signature, 'utf-8');
-
-    if (expectedBuffer.length !== signatureBuffer.length) {
-      return false;
-    }
-
-    return crypto.timingSafeEqual(expectedBuffer, signatureBuffer);
   }
 
-  async handleWebhook(rawBody: Buffer, signature: string) {
-    const isValid = this.verifySignature(rawBody, signature);
-    if (!isValid) {
-      throw new UnauthorizedException('Invalid webhook signature');
+  verifyWebhookSignature(rawBody: Buffer, signature: string): boolean {
+    const secret = this.getSecretKey();
+    const hash = crypto.createHmac('sha512', secret).update(rawBody).digest('hex');
+    try {
+      return crypto.timingSafeEqual(Buffer.from(hash), Buffer.from(signature));
+    } catch {
+      return false;
     }
+  }
 
-    const event = JSON.parse(rawBody.toString('utf-8')) as {
-      event: string;
-      data: { reference: string; amount: number };
-    };
-
+  async handleWebhook(event: any) {
     if (event.event === 'charge.success') {
-      const reference = event.data.reference;
+      const reference = event.data?.reference;
+      const customerCode = event.data?.customer?.customer_code;
+
       const escrow = await this.escrowService.findByReference(reference);
-
-      if (!escrow) {
-        console.warn(`Webhook received for unknown reference: ${reference}`);
-        return { received: true };
+      if (escrow) {
+        await this.escrowService.lockFunds(escrow.id);
+        return { status: 'success', message: 'Escrow funded via Paystack checkout' };
       }
 
-      if (escrow.totalStatus !== EscrowStatus.INITIATED) {
-        return { received: true };
+      if (customerCode) {
+        const user = await this.usersRepository.findOneBy({ paystackCustomerCode: customerCode });
+        if (user) {
+          const amountNaira = Number(event.data.amount) / 100;
+          user.walletBalance = Number(user.walletBalance) + amountNaira;
+          await this.usersRepository.save(user);
+          return { status: 'success', message: `Wallet credited with NGN ${amountNaira}` };
+        }
       }
-
-      const expectedKobo = Math.round(
-        (Number(escrow.tranche1Amount) + Number(escrow.tranche2Amount)) * 100,
-      );
-      if (event.data.amount !== expectedKobo) {
-        console.error(
-          `Amount mismatch for ${reference}: got ${event.data.amount}, expected ${expectedKobo}`,
-        );
-        return { received: true };
-      }
-
-      await this.escrowService.lockFunds(escrow.id);
     }
 
-    return { received: true };
+    return { status: 'ignored', message: 'Unhandled event' };
   }
 }

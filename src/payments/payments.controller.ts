@@ -1,46 +1,75 @@
 import {
   Controller,
   Post,
+  Get,
   Body,
+  Query,
+  Headers,
+  Req,
+  BadRequestException,
   UseGuards,
   Request,
-  Req,
-  Headers,
 } from '@nestjs/common';
-import type { RawBodyRequest } from '@nestjs/common';
 import { PaymentsService } from './payments.service';
-import { InitializePaymentDto } from './dto/initialize-payment.dto';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 
-interface AuthenticatedRequest extends Request {
+interface AuthenticatedRequest {
   user: {
     userId: string;
     email: string;
     role: string;
   };
+  [key: string]: any;
 }
 
 @Controller('payments')
 export class PaymentsController {
-  constructor(private paymentsService: PaymentsService) {}
+  constructor(private readonly paymentsService: PaymentsService) {}
 
   @UseGuards(JwtAuthGuard)
   @Post('initialize')
-  initialize(
-    @Body() dto: InitializePaymentDto,
+  initializePayment(
+    @Body('escrowId') escrowId: string,
     @Request() req: AuthenticatedRequest,
   ) {
-    return this.paymentsService.initialize(dto.escrowId, req.user.userId);
+    if (!escrowId) {
+      throw new BadRequestException('escrowId is required');
+    }
+    return this.paymentsService.initializePayment(escrowId, req.user.email);
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Get('bank/resolve')
+  resolveBank(
+    @Query('accountNumber') accountNumber: string,
+    @Query('bankCode') bankCode: string,
+  ) {
+    if (!accountNumber || !bankCode) {
+      throw new BadRequestException('accountNumber and bankCode are required');
+    }
+    return this.paymentsService.resolveBankAccount(accountNumber, bankCode);
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Post('dedicated-account')
+  assignDedicatedAccount(@Request() req: AuthenticatedRequest) {
+    return this.paymentsService.assignDedicatedVirtualAccount(req.user.userId);
   }
 
   @Post('webhook')
   handleWebhook(
-    @Req() req: RawBodyRequest<Request>,
     @Headers('x-paystack-signature') signature: string,
+    @Req() req: any,
   ) {
-    return this.paymentsService.handleWebhook(
-      req.rawBody as Buffer,
-      signature,
-    );
+    if (!signature) {
+      throw new BadRequestException('Missing signature');
+    }
+    const rawBody = req.rawBody || Buffer.from(JSON.stringify(req.body));
+    const isValid = this.paymentsService.verifyWebhookSignature(rawBody, signature);
+
+    if (!isValid) {
+      throw new BadRequestException('Invalid signature');
+    }
+    return this.paymentsService.handleWebhook(req.body);
   }
 }
