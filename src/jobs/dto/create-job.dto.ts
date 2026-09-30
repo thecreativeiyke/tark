@@ -20,6 +20,16 @@ export class CreateJobDto {
   @Min(0)
   budget: number;
 
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  tranche1Amount?: number;
+
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  tranche2Amount?: number;
+
   @IsString()
   location: string;
 
