@@ -147,7 +147,10 @@ export class EscrowService {
   async initiateHandshake(id: string, artisanId: string, proofOfWorkUrls?: string[]) {
     const escrow = await this.findOne(id);
 
-    if (escrow.artisanId && escrow.artisanId !== artisanId) {
+    if (!escrow.artisanId) {
+      throw new BadRequestException('Cannot initiate handshake: No artisan is assigned to this escrow');
+    }
+    if (escrow.artisanId !== artisanId) {
       throw new BadRequestException('Only the assigned artisan can initiate handshake');
     }
 
@@ -192,7 +195,17 @@ export class EscrowService {
       throw new BadRequestException('Handshake PIN not found');
     }
 
+    if (!escrow.artisanId || escrow.artisanId !== artisanId) {
+      throw new BadRequestException('Only the assigned artisan can verify the handshake PIN');
+    }
+
     if (new Date() > escrow.handshakeExpiresAt) {
+      escrow.handshakePin = null;
+      escrow.handshakeExpiresAt = null;
+      escrow.totalStatus = escrow.tranche1Status === TrancheStatus.RELEASED
+        ? EscrowStatus.TRANCHE_1_RELEASED
+        : EscrowStatus.FUNDS_LOCKED;
+      await this.escrowRepository.save(escrow);
       throw new BadRequestException('Handshake PIN has expired. Please initiate a new one.');
     }
 
@@ -213,6 +226,7 @@ export class EscrowService {
       }
     }
 
+    escrow.tranche1Status = TrancheStatus.RELEASED;
     escrow.tranche2Status = TrancheStatus.RELEASED;
     escrow.totalStatus = EscrowStatus.SETTLED;
     escrow.handshakePin = null;

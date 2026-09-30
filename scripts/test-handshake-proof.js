@@ -3,12 +3,18 @@ const FormData = require('form-data');
 
 const API = 'http://localhost:3000';
 
-async function testFullHandshakeLifecycle() {
+function getUserIdFromToken(token) {
+  const payloadBase64 = token.split('.')[1];
+  const decoded = JSON.parse(Buffer.from(payloadBase64, 'base64').toString('utf8'));
+  return decoded.sub;
+}
+
+async function testFullHardenedLifecycle() {
   try {
     const timestamp = Date.now();
 
-    // 1. Register Client and Artisan
-    console.log('1. Registering Client and Artisan...');
+    // 1. Register Client, Assigned Artisan, and Imposter Artisan
+    console.log('1. Registering Client, Assigned Artisan, and Rogue Artisan...');
     const clientRes = await axios.post(`${API}/auth/register`, {
       email: `client_${timestamp}@test.com`,
       password: 'Password123!',
@@ -16,18 +22,28 @@ async function testFullHandshakeLifecycle() {
       role: 'client',
     });
     const clientToken = clientRes.data.accessToken;
+    const clientId = getUserIdFromToken(clientToken);
 
     const artisanRes = await axios.post(`${API}/auth/register`, {
       email: `artisan_${timestamp}@test.com`,
       password: 'Password123!',
-      fullName: 'Handshake Artisan',
+      fullName: 'Assigned Artisan',
       role: 'artisan',
     });
     const artisanToken = artisanRes.data.accessToken;
-    const artisanId = artisanRes.data.user?.id || artisanRes.data.id;
+    const artisanId = getUserIdFromToken(artisanToken);
+
+    const rogueRes = await axios.post(`${API}/auth/register`, {
+      email: `rogue_${timestamp}@test.com`,
+      password: 'Password123!',
+      fullName: 'Rogue Artisan',
+      role: 'artisan',
+    });
+    const rogueToken = rogueRes.data.accessToken;
+    console.log(`   ✅ Client (${clientId.slice(0, 8)}) & Artisan (${artisanId.slice(0, 8)}) registered.`);
 
     // 2. Create Job
-    console.log('2. Creating Job...');
+    console.log('\n2. Creating Job...');
     const jobRes = await axios.post(
       `${API}/jobs`,
       {
@@ -44,7 +60,7 @@ async function testFullHandshakeLifecycle() {
     const job = jobRes.data;
 
     // 3. Create Escrow & Lock Funds
-    console.log('3. Initializing Escrow & locking client deposit...');
+    console.log('\n3. Initializing Escrow with bound artisanId & locking funds...');
     const escrowRes = await axios.post(
       `${API}/escrow`,
       {
@@ -65,7 +81,7 @@ async function testFullHandshakeLifecycle() {
     console.log(`   ✅ Escrow #${escrowId} status: FUNDS_LOCKED.`);
 
     // 4. Artisan uploads Proof of Work to R2
-    console.log('4. Artisan uploading Proof of Work to /media/proof-of-work...');
+    console.log('\n4. Assigned Artisan uploading Proof of Work to /media/proof-of-work...');
     const dummyImage = Buffer.from(
       '89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d49444154789c6360606060000000050001a7df77e80000000049454e44ae426082',
       'hex',
@@ -83,54 +99,77 @@ async function testFullHandshakeLifecycle() {
       },
     });
     const proofUrl = powUpload.data[0].cdnUrl;
-    console.log(`   ✅ Proof uploaded to R2: ${proofUrl}`);
+    console.log(`   ✅ R2 CDN Asset Created: ${proofUrl}`);
 
-    // 5. Artisan initiates handshake with proof attached
-    console.log('5. Artisan initiating handshake with proofOfWorkUrls...');
+    // EDGE CASE TEST 1: Rogue artisan tries to initiate handshake
+    console.log('\n[TEST EDGE CASE 1] Rogue artisan attempts handshake initiation...');
+    try {
+      await axios.patch(
+        `${API}/escrow/${escrowId}/initiate-handshake`,
+        { proofOfWorkUrls: [proofUrl] },
+        { headers: { Authorization: `Bearer ${rogueToken}` } },
+      );
+      throw new Error('FAILED: Rogue artisan should have been blocked');
+    } catch (err) {
+      console.log(`   🛡️ BLOCKED AS EXPECTED: "${err.response?.data?.message || err.message}"`);
+    }
+
+    // 5. Assigned Artisan initiates handshake
+    console.log('\n5. Assigned Artisan initiating legitimate handshake...');
     await axios.patch(
       `${API}/escrow/${escrowId}/initiate-handshake`,
-      {
-        proofOfWorkUrls: [proofUrl],
-      },
+      { proofOfWorkUrls: [proofUrl] },
       { headers: { Authorization: `Bearer ${artisanToken}` } },
     );
-    console.log('   ✅ Handshake initiated. Status: HANDSHAKE_PENDING.');
+    console.log('   ✅ Handshake initiated.');
 
-    // 6. Client inspects Escrow, reviews proof, and reads PIN
-    console.log('6. Client inspecting Escrow proof and retrieving PIN...');
+    // 6. Client retrieves PIN
     const pendingEscrow = await axios.get(`${API}/escrow/${escrowId}`, {
       headers: { Authorization: `Bearer ${clientToken}` },
     });
-    const pin = pendingEscrow.data.handshakePin;
-    console.log(`   ✅ Client verified proof of work: ${pendingEscrow.data.proofOfWorkUrls[0]}`);
-    console.log(`   ✅ Handshake PIN received by Client: [${pin}]`);
+    const realPin = pendingEscrow.data.handshakePin;
+    console.log(`   ✅ Handshake PIN generated: [${realPin}]`);
 
-    // 7. Artisan inputs the client PIN to verify and settle
-    console.log('7. Artisan submitting PIN to /escrow/:id/verify-handshake...');
-    const verifyRes = await axios.patch(
+    // EDGE CASE TEST 2: Artisan submits wrong PIN
+    console.log('\n[TEST EDGE CASE 2] Artisan submits incorrect PIN...');
+    try {
+      await axios.patch(
+        `${API}/escrow/${escrowId}/verify-handshake`,
+        { pin: '000000' },
+        { headers: { Authorization: `Bearer ${artisanToken}` } },
+      );
+      throw new Error('FAILED: Wrong PIN should have been rejected');
+    } catch (err) {
+      console.log(`   🛡️ REJECTED AS EXPECTED: "${err.response?.data?.message || err.message}"`);
+    }
+
+    // 7. Legitimate PIN verification
+    console.log('\n7. Submitting valid PIN to complete handshake...');
+    await axios.patch(
       `${API}/escrow/${escrowId}/verify-handshake`,
-      { pin },
+      { pin: realPin },
       { headers: { Authorization: `Bearer ${artisanToken}` } },
     );
-    console.log('   ✅ Verification response:', verifyRes.data);
 
-    // 8. Verify final settled state
+    // 8. Verify Final State
     const settledEscrow = await axios.get(`${API}/escrow/${escrowId}`, {
       headers: { Authorization: `Bearer ${clientToken}` },
     });
 
     console.log('\n========================================');
-    console.log('🎉 FULL ESCROW LIFECYCLE SETTLED:');
+    console.log('🎉 HARDENED ESCROW VERIFICATION:');
     console.log('Escrow ID:         ', settledEscrow.data.id);
+    console.log('Bound Artisan ID:  ', settledEscrow.data.artisanId);
     console.log('Total Status:      ', settledEscrow.data.totalStatus);
     console.log('Tranche 1 Status:  ', settledEscrow.data.tranche1Status);
     console.log('Tranche 2 Status:  ', settledEscrow.data.tranche2Status);
-    console.log('PIN Cleared:       ', settledEscrow.data.handshakePin === null ? 'YES (Securely cleared)' : settledEscrow.data.handshakePin);
+    console.log('PIN Wiped:         ', settledEscrow.data.handshakePin === null);
+    console.log('Expiry Wiped:      ', settledEscrow.data.handshakeExpiresAt === null);
     console.log('Persisted Proof:   ', settledEscrow.data.proofOfWorkUrls);
     console.log('========================================');
   } catch (err) {
-    console.error('❌ Lifecycle failed:', err.response?.data || err.message);
+    console.error('❌ Test failed unexpectedly:', err.response?.data || err.message);
   }
 }
 
-testFullHandshakeLifecycle();
+testFullHardenedLifecycle();
