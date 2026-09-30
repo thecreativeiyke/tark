@@ -4,6 +4,7 @@ import {
   Get,
   Body,
   Query,
+  Param,
   Headers,
   Req,
   BadRequestException,
@@ -25,6 +26,25 @@ interface AuthenticatedRequest {
 @Controller('payments')
 export class PaymentsController {
   constructor(private readonly paymentsService: PaymentsService) {}
+
+  @Get('banks')
+  getSupportedBanks(
+    @Query('country') country?: string,
+    @Query('currency') currency?: string,
+    @Query('type') type?: string,
+    @Query('search') search?: string,
+  ) {
+    return this.paymentsService.getSupportedBanks({ country, currency, type, search });
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Get('pay-for-me/:escrowId')
+  getPayForMe(
+    @Param('escrowId') escrowId: string,
+    @Request() req: AuthenticatedRequest,
+  ) {
+    return this.paymentsService.generatePayForMe(escrowId, req.user.userId);
+  }
 
   @UseGuards(JwtAuthGuard)
   @Post('initialize')
@@ -55,11 +75,12 @@ export class PaymentsController {
   resolveBank(
     @Query('accountNumber') accountNumber: string,
     @Query('bankCode') bankCode: string,
+    @Query('currency') currency?: string,
   ) {
     if (!accountNumber || !bankCode) {
       throw new BadRequestException('accountNumber and bankCode are required');
     }
-    return this.paymentsService.resolveBankAccount(accountNumber, bankCode);
+    return this.paymentsService.resolveBankAccount(accountNumber, bankCode, currency || 'NGN');
   }
 
   @UseGuards(JwtAuthGuard)
@@ -67,12 +88,18 @@ export class PaymentsController {
   saveBank(
     @Body('accountNumber') accountNumber: string,
     @Body('bankCode') bankCode: string,
+    @Body('currency') currency: string,
     @Request() req: AuthenticatedRequest,
   ) {
     if (!accountNumber || !bankCode) {
       throw new BadRequestException('accountNumber and bankCode are required');
     }
-    return this.paymentsService.saveArtisanBank(req.user.userId, accountNumber, bankCode);
+    return this.paymentsService.saveArtisanBank(
+      req.user.userId,
+      accountNumber,
+      bankCode,
+      currency || 'NGN',
+    );
   }
 
   @UseGuards(JwtAuthGuard)

@@ -11,10 +11,18 @@ import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import axios from 'axios';
-import * as crypto from 'crypto';
 import { EscrowService } from '../escrow/escrow.service';
 import { EscrowStatus } from '../escrow/entities/escrow-transaction.entity';
 import { User } from '../users/entities/user.entity';
+import { Job } from '../jobs/entities/job.entity';
+import { PaymentGatewayResolver } from './gateways/payment-gateway.resolver';
+
+export interface BankFilterQuery {
+  country?: string;
+  currency?: string;
+  type?: string;
+  search?: string;
+}
 
 @Injectable()
 export class PaymentsService {
@@ -23,10 +31,13 @@ export class PaymentsService {
 
   constructor(
     private configService: ConfigService,
+    private gatewayResolver: PaymentGatewayResolver,
     @Inject(forwardRef(() => EscrowService))
     private escrowService: EscrowService,
     @InjectRepository(User)
     private usersRepository: Repository<User>,
+    @InjectRepository(Job)
+    private jobsRepository: Repository<Job>,
   ) {}
 
   private getSecretKey(): string {
@@ -44,30 +55,201 @@ export class PaymentsService {
     };
   }
 
+  // Real-time Third-Party Bank API Directory
+  async getSupportedBanks(filters: BankFilterQuery = {}) {
+    const { country = 'nigeria', currency = 'NGN', type = 'nuban', search } = filters;
+
+    try {
+      const response = await axios.get(
+        `${this.paystackBaseUrl}/bank`,
+        {
+          headers: this.getHeaders(),
+          params: {
+            country: country.toLowerCase(),
+            currency: currency.toUpperCase(),
+            type,
+            perPage: 100,
+          },
+        },
+      );
+
+      const digitalSlugs = [
+        'opay',
+        'palmpay',
+        'kuda-bank',
+        'moniepoint-microfinance-bank',
+        'fairmoney',
+        'carbon',
+        'rubies-bank',
+        'vfd-microfinance-bank',
+        'sparkle-microfinance-bank',
+      ];
+
+      let banks = response.data.data.map((b: any) => ({
+        id: b.id,
+        name: b.name,
+        slug: b.slug,
+        code: b.code,
+        active: b.active,
+        isDigital: digitalSlugs.some((slug) => b.slug.includes(slug)),
+        category: digitalSlugs.some((slug) => b.slug.includes(slug))
+          ? 'Digital / Fintech Bank'
+          : 'Commercial Bank',
+      }));
+
+      if (search && search.trim().length > 0) {
+        const query = search.trim().toLowerCase();
+        banks = banks.filter(
+          (b: any) =>
+            b.name.toLowerCase().includes(query) ||
+            b.slug.toLowerCase().includes(query) ||
+            b.code.includes(query),
+        );
+      }
+
+      return {
+        total: banks.length,
+        country: country.toLowerCase(),
+        currency: currency.toUpperCase(),
+        banks,
+      };
+    } catch (error: any) {
+      this.logger.error('Failed to fetch real-time bank directory', error?.response?.data || error.message);
+      throw new BadRequestException('Could not retrieve live banks list from provider');
+    }
+  }
+
   async initializePayment(escrowId: string, email: string) {
     const escrow = await this.escrowService.findOne(escrowId);
     const totalAmount = Number(escrow.tranche1Amount) + Number(escrow.tranche2Amount);
-    const amountInKobo = Math.round(totalAmount * 100);
-    const reference = `tark-${escrow.id}-${Date.now()}`;
+    const amountMinor = Math.round(totalAmount * 100);
+    const currency = escrow.currency || 'NGN';
 
-    try {
-      const response = await axios.post(
-        `${this.paystackBaseUrl}/transaction/initialize`,
-        {
-          email,
-          amount: amountInKobo,
-          reference,
-          metadata: { escrowId: escrow.id },
-        },
-        { headers: this.getHeaders() },
-      );
+    const gateway = this.gatewayResolver.resolveByCurrency(currency);
+    const result = await gateway.initializePayment({
+      escrowId: escrow.id,
+      email,
+      amountMinor,
+      currency,
+    });
 
-      await this.escrowService.attachPaystackReference(escrow.id, reference);
-      return response.data.data;
-    } catch (error: any) {
-      this.logger.error('Payment initialization failed', error?.response?.data || error.message);
-      throw new BadRequestException('Failed to initialize payment with Paystack');
+    await this.escrowService.attachPaystackReference(escrow.id, result.reference);
+    return {
+      authorization_url: result.authorizationUrl,
+      reference: result.reference,
+      provider: gateway.providerName,
+    };
+  }
+
+  async generatePayForMe(escrowId: string, clientId: string) {
+    const escrow = await this.escrowService.findOne(escrowId);
+    if (escrow.clientId !== clientId) {
+      throw new BadRequestException('Only the client who initiated this escrow can generate a Pay For Me link');
     }
+
+    const client = await this.usersRepository.findOneBy({ id: clientId });
+    if (!client) {
+      throw new NotFoundException('Client not found');
+    }
+
+    const job = await this.jobsRepository.findOneBy({ id: escrow.jobId });
+    if (!job) {
+      throw new NotFoundException('Job associated with escrow not found');
+    }
+
+    let artisanName: string | null = null;
+    if (escrow.artisanId) {
+      const artisan = await this.usersRepository.findOneBy({ id: escrow.artisanId });
+      artisanName = artisan ? artisan.fullName : null;
+    }
+
+    const totalAmount = Number(escrow.tranche1Amount) + Number(escrow.tranche2Amount);
+    const currency = escrow.currency || 'NGN';
+    const formattedAmount = `${currency}${totalAmount.toLocaleString('en-US', { minimumFractionDigits: 2 })}`;
+
+    const paymentData = await this.initializePayment(escrow.id, client.email);
+    const checkoutUrl = paymentData.authorization_url;
+
+    const dva = client.virtualAccountNumber
+      ? {
+          bankName: client.virtualBankName || 'Paystack-Titan',
+          accountNumber: client.virtualAccountNumber,
+          accountName: `Tark - ${client.fullName}`,
+        }
+      : null;
+
+    const messageLines = [
+      `Payment Request from ${client.fullName} via Tark`,
+      `--------------------------------------------------`,
+      `Service: ${job.title}`,
+      `Category: ${job.category}`,
+      `Location: ${job.location}`,
+      artisanName ? `Assigned Artisan: ${artisanName}` : null,
+      `Total Budget: ${formattedAmount}`,
+      `Breakdown: Tranche 1 (${currency}${Number(escrow.tranche1Amount).toLocaleString()}) | Tranche 2 (${currency}${Number(escrow.tranche2Amount).toLocaleString()})`,
+      ``,
+      `🛡️ Escrow Guarantee: Funds remain securely held in Tark Escrow and are only released in milestones as verified work is completed.`,
+      ``,
+      `💳 Option 1 - Pay Online (Card / USSD / Bank App):`,
+      checkoutUrl,
+    ];
+
+    if (dva) {
+      messageLines.push(
+        ``,
+        `🏦 Option 2 - Direct Bank Transfer (Instant Escrow Credit):`,
+        `Bank: ${dva.bankName}`,
+        `Account Number: ${dva.accountNumber}`,
+        `Account Name: ${dva.accountName}`,
+      );
+    }
+
+    messageLines.push(
+      ``,
+      `Thank you for helping fund this service!`,
+    );
+
+    const fullMessage = messageLines.filter((l) => l !== null).join('\n');
+    const emailSubject = `Payment Request: ${job.title} (${formattedAmount}) for ${client.fullName}`;
+
+    return {
+      metadata: {
+        escrowId: escrow.id,
+        jobId: job.id,
+        jobTitle: job.title,
+        jobLocation: job.location,
+        clientName: client.fullName,
+        artisanName,
+        currency,
+        totalAmount,
+        tranche1Amount: Number(escrow.tranche1Amount),
+        tranche2Amount: Number(escrow.tranche2Amount),
+      },
+      paymentRails: {
+        onlineCheckoutUrl: checkoutUrl,
+        virtualAccount: dva,
+      },
+      shareChannels: {
+        webShare: {
+          title: `Fund Service on Tark: ${job.title}`,
+          text: `Hi, please assist ${client.fullName} in funding "${job.title}" (${formattedAmount}) securely on Tark.`,
+          url: checkoutUrl,
+        },
+        clipboardText: fullMessage,
+        whatsappUrl: `https://wa.me/?text=${encodeURIComponent(fullMessage)}`,
+        telegramUrl: `https://t.me/share/url?url=${encodeURIComponent(checkoutUrl)}&text=${encodeURIComponent(
+          `Hi, please help fund "${job.title}" (${formattedAmount}) for${client.fullName} on Tark Escrow.`,
+        )}`,
+        smsUrl: `sms:?body=${encodeURIComponent(
+          `Hi, please help fund "${job.title}" (${formattedAmount}) for ${client.fullName} on Tark:${checkoutUrl}`,
+        )}`,
+        email: {
+          subject: emailSubject,
+          body: fullMessage,
+          mailtoUrl: `mailto:?subject=${encodeURIComponent(emailSubject)}&body=${encodeURIComponent(fullMessage)}`,
+        },
+      },
+    };
   }
 
   async fundEscrowWithWallet(escrowId: string, userId: string) {
@@ -108,72 +290,57 @@ export class PaymentsService {
     };
   }
 
-  async resolveBankAccount(accountNumber: string, bankCode: string) {
-    try {
-      const response = await axios.get(
-        `${this.paystackBaseUrl}/bank/resolve?account_number=${accountNumber}&bank_code=${bankCode}`,
-        { headers: this.getHeaders() },
-      );
-      return response.data.data;
-    } catch (error: any) {
-      this.logger.error('Bank resolution failed', error?.response?.data || error.message);
-      throw new BadRequestException('Could not resolve bank account details');
+  async resolveBankAccount(accountNumber: string, bankCode: string, currency = 'NGN') {
+    const gateway = this.gatewayResolver.resolveByCurrency(currency);
+    if (!gateway.resolveAccount) {
+      throw new BadRequestException(`Gateway ${gateway.providerName} does not support account resolution`);
     }
+    return gateway.resolveAccount(accountNumber, bankCode);
   }
 
-  async createTransferRecipient(name: string, accountNumber: string, bankCode: string) {
-    try {
-      const response = await axios.post(
-        `${this.paystackBaseUrl}/transferrecipient`,
-        {
-          type: 'nuban',
-          name,
-          account_number: accountNumber,
-          bank_code: bankCode,
-          currency: 'NGN',
-        },
-        { headers: this.getHeaders() },
-      );
-      return response.data.data.recipient_code;
-    } catch (error: any) {
-      this.logger.error('Recipient creation failed', error?.response?.data || error.message);
-      throw new BadRequestException('Failed to create transfer recipient on Paystack');
-    }
-  }
-
-  async saveArtisanBank(userId: string, accountNumber: string, bankCode: string) {
+  async saveArtisanBank(
+    userId: string,
+    accountNumber: string,
+    bankCode: string,
+    currency = 'NGN',
+  ) {
     const user = await this.usersRepository.findOneBy({ id: userId });
     if (!user) {
       throw new NotFoundException('User not found');
     }
 
+    const gateway = this.gatewayResolver.resolveByCurrency(currency);
+
     let resolvedName = user.fullName;
-    try {
-      const bankData = await this.resolveBankAccount(accountNumber, bankCode);
-      resolvedName = bankData.account_name;
-    } catch (err: any) {
-      this.logger.warn(`Bank resolution bypassed or failed in test mode: ${err.message}`);
+    if (gateway.resolveAccount) {
+      try {
+        const resolved = await gateway.resolveAccount(accountNumber, bankCode);
+        resolvedName = resolved.accountName;
+      } catch (err: any) {
+        this.logger.warn(`Bank resolution bypassed or failed in test mode: ${err.message}`);
+      }
     }
 
     let recipientCode = `RCP_${Date.now()}`;
     try {
-      recipientCode = await this.createTransferRecipient(resolvedName, accountNumber, bankCode);
+      recipientCode = await gateway.createRecipient(resolvedName, accountNumber, bankCode, currency);
     } catch (err: any) {
-      this.logger.warn(`Recipient creation simulated for testing: ${err.message}`);
+      this.logger.warn(`Recipient creation simulated: ${err.message}`);
     }
 
     user.payoutAccountIdentifier = accountNumber;
     user.payoutBankOrNetwork = bankCode;
     user.payoutRecipientCode = recipientCode;
-    user.payoutProvider = 'paystack';
+    user.payoutProvider = gateway.providerName;
 
     const savedUser = await this.usersRepository.save(user);
     const { password: _, ...sanitized } = savedUser;
 
     return {
-      message: 'Artisan bank details saved successfully',
+      message: 'Artisan payout details saved successfully',
       accountName: resolvedName,
       recipientCode,
+      provider: gateway.providerName,
       user: sanitized,
     };
   }
@@ -210,7 +377,7 @@ export class PaymentsService {
         user.paystackCustomerCode = customerCode;
         await this.usersRepository.save(user);
       } catch (err: any) {
-        this.logger.error('Failed to create Paystack customer', err?.response?.data || err.message);
+        this.logger.error('Failed to create customer on provider', err?.response?.data || err.message);
         customerCode = `CUS_${Date.now()}`;
         user.paystackCustomerCode = customerCode;
         await this.usersRepository.save(user);
@@ -232,9 +399,7 @@ export class PaymentsService {
       user.virtualBankName = dvaData.bank.name;
       await this.usersRepository.save(user);
     } catch (error: any) {
-      this.logger.warn(
-        `Paystack DVA live provision unavailable (${error?.response?.data?.message || error.message}). Activating Sandbox DVA.`,
-      );
+      this.logger.warn(`DVA live provision unavailable. Activating Sandbox DVA.`);
       user.virtualAccountNumber = `96${Math.floor(10000000 + Math.random() * 90000000)}`;
       user.virtualBankName = 'Paystack-Titan (Sandbox)';
       await this.usersRepository.save(user);
@@ -247,41 +412,24 @@ export class PaymentsService {
     };
   }
 
-  async initiateTransfer(amountKobo: number, recipientCode: string, reason: string) {
-    try {
-      const response = await axios.post(
-        `${this.paystackBaseUrl}/transfer`,
-        {
-          source: 'balance',
-          amount: amountKobo,
-          recipient: recipientCode,
-          reason,
-        },
-        { headers: this.getHeaders() },
-      );
-      this.logger.log(`Transfer executed: ${JSON.stringify(response.data.data)}`);
-      return response.data.data;
-    } catch (error: any) {
-      this.logger.warn(
-        `Paystack transfer notice (${error?.response?.data?.message || error.message}). Handled for test environment.`,
-      );
-      return {
-        status: 'queued',
-        amount: amountKobo,
-        recipient: recipientCode,
-        simulated: true,
-      };
-    }
+  async initiateTransfer(
+    amountMinor: number,
+    recipientCode: string,
+    reason: string,
+    currency = 'NGN',
+  ) {
+    const gateway = this.gatewayResolver.resolveByCurrency(currency);
+    return gateway.initiateTransfer({
+      amountMinor,
+      currency,
+      recipientCode,
+      reason,
+    });
   }
 
-  verifyWebhookSignature(rawBody: Buffer, signature: string): boolean {
-    const secret = this.getSecretKey();
-    const hash = crypto.createHmac('sha512', secret).update(rawBody).digest('hex');
-    try {
-      return crypto.timingSafeEqual(Buffer.from(hash), Buffer.from(signature));
-    } catch {
-      return false;
-    }
+  verifyWebhookSignature(rawBody: Buffer, signature: string, provider = 'paystack'): boolean {
+    const gateway = this.gatewayResolver.resolveByProvider(provider);
+    return gateway.verifyWebhook(rawBody, signature);
   }
 
   async handleWebhook(event: any) {
@@ -292,16 +440,16 @@ export class PaymentsService {
       const escrow = await this.escrowService.findByReference(reference);
       if (escrow) {
         await this.escrowService.lockFunds(escrow.id);
-        return { status: 'success', message: 'Escrow funded via Paystack checkout' };
+        return { status: 'success', message: 'Escrow funded via online checkout' };
       }
 
       if (customerCode) {
         const user = await this.usersRepository.findOneBy({ paystackCustomerCode: customerCode });
         if (user) {
-          const amountNaira = Number(event.data.amount) / 100;
-          user.walletBalance = Number(user.walletBalance) + amountNaira;
+          const amountMajor = Number(event.data.amount) / 100;
+          user.walletBalance = Number(user.walletBalance) + amountMajor;
           await this.usersRepository.save(user);
-          return { status: 'success', message: `Wallet credited with NGN ${amountNaira}` };
+          return { status: 'success', message: `Wallet credited with NGN ${amountMajor}` };
         }
       }
     }
