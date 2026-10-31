@@ -8,8 +8,8 @@ import {
   forwardRef,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { InjectRepository, InjectDataSource } from '@nestjs/typeorm';
+import { Repository, DataSource } from 'typeorm';
 import axios from 'axios';
 import { EscrowService } from '../escrow/escrow.service';
 import { EscrowStatus } from '../escrow/entities/escrow-transaction.entity';
@@ -38,6 +38,8 @@ export class PaymentsService {
     private usersRepository: Repository<User>,
     @InjectRepository(Job)
     private jobsRepository: Repository<Job>,
+    @InjectDataSource()
+    private dataSource: DataSource,
   ) {}
 
   private getSecretKey(): string {
@@ -252,7 +254,12 @@ export class PaymentsService {
     };
   }
 
+  // ─────────────────────────────────────────────────────────────────────
+  // WALLET FUNDING — uses a row-level lock to prevent double-spend.
+  // Two simultaneous requests cannot both pass the balance check.
+  // ─────────────────────────────────────────────────────────────────────
   async fundEscrowWithWallet(escrowId: string, userId: string) {
+    // Validate the escrow first (outside the transaction — read-only, safe)
     const escrow = await this.escrowService.findOne(escrowId);
 
     if (escrow.clientId !== userId) {
@@ -260,32 +267,43 @@ export class PaymentsService {
     }
 
     if (escrow.totalStatus !== EscrowStatus.INITIATED) {
-      throw new BadRequestException(`Escrow is already ${escrow.totalStatus}`);
+      throw new BadRequestException(`Escrow is already in status: ${escrow.totalStatus}`);
     }
 
     const totalAmount = Number(escrow.tranche1Amount) + Number(escrow.tranche2Amount);
-    const user = await this.usersRepository.findOneBy({ id: userId });
 
-    if (!user) {
-      throw new NotFoundException('User not found');
-    }
+    // Run the balance check + deduction inside a transaction with a row lock
+    // This means only one request at a time can touch this user's wallet row
+    const result = await this.dataSource.transaction(async (manager) => {
+      const user = await manager.findOne(User, {
+        where: { id: userId },
+        lock: { mode: 'pessimistic_write' }, // SELECT FOR UPDATE
+      });
 
-    const currentBalance = Number(user.walletBalance || 0);
-    if (currentBalance < totalAmount) {
-      throw new BadRequestException(
-        `Insufficient wallet balance. Required: NGN ${totalAmount}, Available: NGN ${currentBalance}`,
-      );
-    }
+      if (!user) {
+        throw new NotFoundException('User not found');
+      }
 
-    user.walletBalance = parseFloat((currentBalance - totalAmount).toFixed(2));
-    await this.usersRepository.save(user);
+      const currentBalance = Number(user.walletBalance || 0);
+      if (currentBalance < totalAmount) {
+        throw new BadRequestException(
+          `Insufficient wallet balance. Required: NGN ${totalAmount.toFixed(2)}, Available: NGN ${currentBalance.toFixed(2)}`,
+        );
+      }
 
+      user.walletBalance = parseFloat((currentBalance - totalAmount).toFixed(2));
+      await manager.save(user);
+
+      return { remainingBalance: user.walletBalance };
+    });
+
+    // Lock the escrow funds (outside the transaction — this is a separate operation)
     const lockedEscrow = await this.escrowService.lockFunds(escrow.id);
 
     return {
       message: 'Escrow funded successfully from wallet',
       deductedAmount: totalAmount,
-      remainingBalance: user.walletBalance,
+      remainingBalance: result.remainingBalance,
       escrow: lockedEscrow,
     };
   }
@@ -439,7 +457,11 @@ export class PaymentsService {
 
       const escrow = await this.escrowService.findByReference(reference);
       if (escrow) {
-        if (escrow.totalStatus === EscrowStatus.FUNDS_LOCKED || escrow.totalStatus === EscrowStatus.HANDSHAKE_PENDING || escrow.totalStatus === EscrowStatus.SETTLED) {
+        if (
+          escrow.totalStatus === EscrowStatus.FUNDS_LOCKED ||
+          escrow.totalStatus === EscrowStatus.HANDSHAKE_PENDING ||
+          escrow.totalStatus === EscrowStatus.SETTLED
+        ) {
           return { status: 'success', message: 'Escrow already funded (idempotent)' };
         }
         await this.escrowService.lockFunds(escrow.id);

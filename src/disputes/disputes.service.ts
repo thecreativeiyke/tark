@@ -1,0 +1,376 @@
+import {
+  Injectable,
+  NotFoundException,
+  BadRequestException,
+  ForbiddenException,
+  Logger,
+} from '@nestjs/common';
+import { InjectRepository, InjectDataSource } from '@nestjs/typeorm';
+import { Repository, DataSource } from 'typeorm';
+import {
+  Dispute,
+  DisputeCategory,
+  DisputeStatus,
+  DisputeVerdict,
+} from './entities/dispute.entity';
+import { CreateDisputeDto } from './dto/create-dispute.dto';
+import { RespondDisputeDto } from './dto/respond-dispute.dto';
+import { ResolveDisputeDto } from './dto/resolve-dispute.dto';
+import { AssignDisputeDto } from './dto/assign-dispute.dto';
+import {
+  EscrowTransaction,
+  EscrowStatus,
+  TrancheStatus,
+} from '../escrow/entities/escrow-transaction.entity';
+import { Job, JobStatus } from '../jobs/entities/job.entity';
+import { User, UserRole } from '../users/entities/user.entity';
+import { PaymentsService } from '../payments/payments.service';
+
+@Injectable()
+export class DisputesService {
+  private readonly logger = new Logger(DisputesService.name);
+
+  constructor(
+    @InjectRepository(Dispute)
+    private disputesRepository: Repository<Dispute>,
+    @InjectRepository(EscrowTransaction)
+    private escrowRepository: Repository<EscrowTransaction>,
+    @InjectRepository(Job)
+    private jobsRepository: Repository<Job>,
+    @InjectRepository(User)
+    private usersRepository: Repository<User>,
+    @InjectDataSource()
+    private dataSource: DataSource,
+    private paymentsService: PaymentsService,
+  ) {}
+
+  // ─────────────────────────────────────────────────────────────────────
+  // 1. OPEN DISPUTE: Initiated by either client or artisan
+  // Freezes the escrow and starts the 48-hour counter-response window
+  // ─────────────────────────────────────────────────────────────────────
+  async create(dto: CreateDisputeDto, initiatorId: string) {
+    const escrow = await this.escrowRepository.findOneBy({ id: dto.escrowId });
+    if (!escrow) {
+      throw new NotFoundException('Escrow transaction not found');
+    }
+
+    if (escrow.clientId !== initiatorId && escrow.artisanId !== initiatorId) {
+      throw new ForbiddenException('You are not a party to this escrow agreement');
+    }
+
+    if (escrow.totalStatus === EscrowStatus.INITIATED) {
+      throw new BadRequestException('Cannot raise a dispute on an unfunded escrow');
+    }
+
+    if (escrow.totalStatus === EscrowStatus.SETTLED) {
+      throw new BadRequestException('Cannot raise a dispute on a completed and settled escrow');
+    }
+
+    // Check for existing active dispute
+    const existing = await this.disputesRepository.findOne({
+      where: [
+        { escrowId: escrow.id, status: DisputeStatus.OPEN },
+        { escrowId: escrow.id, status: DisputeStatus.AWAITING_REVIEW },
+        { escrowId: escrow.id, status: DisputeStatus.UNDER_INVESTIGATION },
+      ],
+    });
+
+    if (existing) {
+      throw new BadRequestException('An active dispute is already open for this escrow transaction');
+    }
+
+    const defendantId = initiatorId === escrow.clientId ? escrow.artisanId : escrow.clientId;
+    if (!defendantId) {
+      throw new BadRequestException('Cannot determine opposing party on this escrow');
+    }
+
+    // Freeze escrow state
+    escrow.totalStatus = EscrowStatus.DISPUTED;
+    escrow.handshakePin = null;
+    escrow.handshakeExpiresAt = null;
+    await this.escrowRepository.save(escrow);
+
+    // Freeze job state
+    await this.jobsRepository.update(escrow.jobId, { status: JobStatus.DISPUTED });
+
+    // 48-hour response deadline for the opposing party
+    const responseDeadline = new Date(Date.now() + 48 * 60 * 60 * 1000);
+
+    const dispute = this.disputesRepository.create({
+      jobId: escrow.jobId,
+      escrowId: escrow.id,
+      initiatorId,
+      defendantId,
+      category: dto.category,
+      claimStatement: dto.claimStatement,
+      evidenceUrls: dto.evidenceUrls || [],
+      responseDeadline,
+      status: DisputeStatus.OPEN,
+      adminDepartment: 'DISPUTE_DESK',
+    });
+
+    const savedDispute = await this.disputesRepository.save(dispute);
+    this.logger.warn(`Dispute opened: #${savedDispute.id} by ${initiatorId} on Escrow #${escrow.id}`);
+
+    return {
+      message: 'Dispute opened successfully. The opposing party has 48 hours to submit their counter-evidence.',
+      dispute: savedDispute,
+      responseDeadline,
+    };
+  }
+
+  // ─────────────────────────────────────────────────────────────────────
+  // 2. DEFENDANT COUNTER-CLAIM: Opposing party provides evidence
+  // ─────────────────────────────────────────────────────────────────────
+  async respond(disputeId: string, dto: RespondDisputeDto, userId: string) {
+    const dispute = await this.disputesRepository.findOneBy({ id: disputeId });
+    if (!dispute) {
+      throw new NotFoundException('Dispute ticket not found');
+    }
+
+    if (dispute.defendantId !== userId) {
+      throw new ForbiddenException('Only the designated respondent can submit counter-evidence');
+    }
+
+    if (dispute.status !== DisputeStatus.OPEN) {
+      throw new BadRequestException(`Cannot submit counter-claim for dispute in status: ${dispute.status}`);
+    }
+
+    dispute.counterStatement = dto.counterStatement;
+    if (dto.counterEvidenceUrls && dto.counterEvidenceUrls.length > 0) {
+      dispute.counterEvidenceUrls = dto.counterEvidenceUrls;
+    }
+    dispute.status = DisputeStatus.AWAITING_REVIEW;
+
+    return this.disputesRepository.save(dispute);
+  }
+
+  // ─────────────────────────────────────────────────────────────────────
+  // 3. ADMIN QUEUE: Dynamic routing and triage
+  // ─────────────────────────────────────────────────────────────────────
+  async getQueue(status?: DisputeStatus, department?: string) {
+    const qb = this.disputesRepository.createQueryBuilder('dispute');
+
+    if (status) {
+      qb.andWhere('dispute.status = :status', { status });
+    }
+    if (department) {
+      qb.andWhere('dispute.adminDepartment = :department', { department });
+    }
+
+    return qb.orderBy('dispute.createdAt', 'ASC').getMany();
+  }
+
+  // ─────────────────────────────────────────────────────────────────────
+  // 4. ADMIN ASSIGNMENT / DEPARTMENT TRANSFER
+  // ─────────────────────────────────────────────────────────────────────
+  async assign(disputeId: string, dto: AssignDisputeDto) {
+    const dispute = await this.disputesRepository.findOneBy({ id: disputeId });
+    if (!dispute) {
+      throw new NotFoundException('Dispute ticket not found');
+    }
+
+    dispute.assignedAdminId = dto.adminId;
+    if (dto.department) {
+      dispute.adminDepartment = dto.department;
+    }
+    dispute.status = DisputeStatus.UNDER_INVESTIGATION;
+
+    return this.disputesRepository.save(dispute);
+  }
+
+  // ─────────────────────────────────────────────────────────────────────
+  // 5. VIEW SINGLE DISPUTE: Enforces access control
+  // ─────────────────────────────────────────────────────────────────────
+  async findOne(disputeId: string, userId: string, role: string) {
+    const dispute = await this.disputesRepository.findOneBy({ id: disputeId });
+    if (!dispute) {
+      throw new NotFoundException('Dispute not found');
+    }
+
+    const isAdmin = role === UserRole.ADMIN || role === UserRole.SUPER_ADMIN;
+    if (!isAdmin && dispute.initiatorId !== userId && dispute.defendantId !== userId) {
+      throw new ForbiddenException('Access denied to this dispute dossier');
+    }
+
+    const [escrow, job, initiator, defendant] = await Promise.all([
+      this.escrowRepository.findOneBy({ id: dispute.escrowId }),
+      this.jobsRepository.findOneBy({ id: dispute.jobId }),
+      this.usersRepository.findOne({
+        where: { id: dispute.initiatorId },
+        select: {
+          id: true,
+          fullName: true,
+          email: true,
+          phoneNumber: true,
+          role: true,
+          isCertifiedByTark: true,
+        },
+      }),
+      this.usersRepository.findOne({
+        where: { id: dispute.defendantId },
+        select: {
+          id: true,
+          fullName: true,
+          email: true,
+          phoneNumber: true,
+          role: true,
+          isCertifiedByTark: true,
+        },
+      }),
+    ]);
+
+    return {
+      dispute,
+      escrow,
+      job,
+      initiator,
+      defendant,
+    };
+  }
+
+  // ─────────────────────────────────────────────────────────────────────
+  // 6. RESOLVE DISPUTE: Authoritative binding verdict
+  // - Client refunds are credited instantly into their in-app wallet.
+  // - Artisan payouts are disbursed via Paystack transfer.
+  // - Platform service fee is non-refundable.
+  // - All database updates execute inside an atomic transaction.
+  // ─────────────────────────────────────────────────────────────────────
+  async resolve(disputeId: string, dto: ResolveDisputeDto, adminId: string) {
+    const dispute = await this.disputesRepository.findOneBy({ id: disputeId });
+    if (!dispute) {
+      throw new NotFoundException('Dispute ticket not found');
+    }
+
+    if (dispute.status === DisputeStatus.RESOLVED) {
+      throw new BadRequestException('This dispute has already been resolved and closed');
+    }
+
+    const escrow = await this.escrowRepository.findOneBy({ id: dispute.escrowId });
+    if (!escrow) {
+      throw new NotFoundException('Associated escrow not found');
+    }
+
+    const client = await this.usersRepository.findOneBy({ id: escrow.clientId });
+    const artisan = escrow.artisanId
+      ? await this.usersRepository.findOneBy({ id: escrow.artisanId })
+      : null;
+
+    if (!client) {
+      throw new NotFoundException('Client associated with escrow not found');
+    }
+
+    // Calculate remaining locked funds available in escrow
+    let totalLockedFunds = 0;
+    if (escrow.tranche1Status !== TrancheStatus.RELEASED) {
+      totalLockedFunds += Number(escrow.tranche1Amount);
+    }
+    if (escrow.tranche2Status !== TrancheStatus.RELEASED) {
+      totalLockedFunds += Number(escrow.tranche2Amount);
+    }
+
+    let clientRefund = 0;
+    let artisanPayout = 0;
+
+    switch (dto.verdict) {
+      case DisputeVerdict.FULL_REFUND_TO_CLIENT:
+        clientRefund = totalLockedFunds;
+        artisanPayout = 0;
+        break;
+
+      case DisputeVerdict.FULL_PAYOUT_TO_ARTISAN:
+        clientRefund = 0;
+        artisanPayout = totalLockedFunds;
+        break;
+
+      case DisputeVerdict.SPLIT_SETTLEMENT: {
+        const reqClient = Number(dto.clientRefundAmount || 0);
+        const reqArtisan = Number(dto.artisanPayoutAmount || 0);
+
+        if (Math.round(reqClient + reqArtisan) !== Math.round(totalLockedFunds)) {
+          throw new BadRequestException(
+            `Split amounts (Client: ₦${reqClient} + Artisan: ₦${reqArtisan} = ₦${reqClient + reqArtisan}) ` +
+            `must equal the total locked escrow balance of ₦${totalLockedFunds}`,
+          );
+        }
+        clientRefund = reqClient;
+        artisanPayout = reqArtisan;
+        break;
+      }
+
+      case DisputeVerdict.MUTUAL_CANCELLATION:
+        clientRefund = totalLockedFunds;
+        artisanPayout = 0;
+        break;
+
+      default:
+        throw new BadRequestException('Invalid dispute resolution verdict');
+    }
+
+    // Execute financial execution and database mutations in an atomic transaction
+    return this.dataSource.transaction(async (manager) => {
+      // 1. Credit Client In-App Wallet if refund is due
+      if (clientRefund > 0) {
+        client.walletBalance = Number(client.walletBalance || 0) + clientRefund;
+        await manager.save(User, client);
+        this.logger.log(`Dispute Refund: ₦${clientRefund} credited to Client (${client.id}) wallet`);
+      }
+
+      // 2. Disburse to Artisan via Paystack transfer if payout is due
+      if (artisanPayout > 0 && artisan) {
+        if (!artisan.payoutRecipientCode) {
+          throw new BadRequestException(
+            `Cannot execute verdict: Artisan has no registered payout recipient code. ` +
+            `Please have them provide bank details before releasing funds.`,
+          );
+        }
+
+        const amountKobo = Math.round(artisanPayout * 100);
+        await this.paymentsService.initiateTransfer(
+          amountKobo,
+          artisan.payoutRecipientCode,
+          `Tark Dispute Settlement: Job #${escrow.jobId.slice(0, 8)}`,
+          escrow.currency,
+        );
+      }
+
+      // 3. Update Escrow status
+      escrow.totalStatus = EscrowStatus.SETTLED;
+      if (clientRefund > 0 && artisanPayout === 0) {
+        escrow.tranche1Status = TrancheStatus.REFUNDED;
+        escrow.tranche2Status = TrancheStatus.REFUNDED;
+      } else {
+        escrow.tranche1Status = TrancheStatus.RELEASED;
+        escrow.tranche2Status = TrancheStatus.RELEASED;
+      }
+      await manager.save(EscrowTransaction, escrow);
+
+      // 4. Update Job status
+      const finalJobStatus =
+        dto.verdict === DisputeVerdict.FULL_PAYOUT_TO_ARTISAN
+          ? JobStatus.COMPLETED
+          : JobStatus.CANCELLED;
+      await manager.update(Job, escrow.jobId, { status: finalJobStatus });
+
+      // 5. Update Dispute Record
+      dispute.verdict = dto.verdict;
+      dispute.clientRefundAmount = clientRefund;
+      dispute.artisanPayoutAmount = artisanPayout;
+      dispute.resolutionNotes = dto.resolutionNotes;
+      dispute.resolvedAt = new Date();
+      dispute.status = DisputeStatus.RESOLVED;
+      dispute.assignedAdminId = adminId;
+      await manager.save(Dispute, dispute);
+
+      return {
+        message: `Dispute resolved successfully with verdict: ${dto.verdict}`,
+        dispute,
+        disbursement: {
+          clientRefundedToWallet: clientRefund,
+          artisanDisbursedToBank: artisanPayout,
+          platformServiceFeeRetained: true,
+        },
+      };
+    });
+  }
+}

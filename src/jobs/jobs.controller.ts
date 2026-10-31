@@ -6,12 +6,14 @@ import {
   Patch,
   Param,
   Delete,
+  Query,
   UseGuards,
   Request,
 } from '@nestjs/common';
 import { JobsService } from './jobs.service';
 import { CreateJobDto } from './dto/create-job.dto';
 import { UpdateJobDto } from './dto/update-job.dto';
+import { QueryJobDto } from './dto/query-job.dto';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 
 interface AuthenticatedRequest extends Request {
@@ -36,8 +38,8 @@ export class JobsController {
   }
 
   @Get()
-  findAll() {
-    return this.jobsService.findAll();
+  findAll(@Query() query: QueryJobDto) {
+    return this.jobsService.findAll(query);
   }
 
   @Get(':id')

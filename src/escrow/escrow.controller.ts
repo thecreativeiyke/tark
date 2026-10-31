@@ -35,20 +35,27 @@ export class EscrowController {
     return this.escrowService.create(createEscrowDto, req.user.userId);
   }
 
+  // User-scoped: masks the PIN from artisans, enforces ownership
   @Get('job/:jobId')
-  findByJobId(@Param('jobId') jobId: string) {
-    return this.escrowService.findByJobId(jobId);
+  findByJobId(
+    @Param('jobId') jobId: string,
+    @Request() req: AuthenticatedRequest,
+  ) {
+    return this.escrowService.findByJobForUser(jobId, req.user.userId);
   }
 
+  // User-scoped: masks the PIN from artisans, enforces ownership
   @Get(':id')
-  findOne(@Param('id') id: string) {
-    return this.escrowService.findOne(id);
+  findOne(
+    @Param('id') id: string,
+    @Request() req: AuthenticatedRequest,
+  ) {
+    return this.escrowService.findOneForUser(id, req.user.userId);
   }
 
-  @Patch(':id/lock-funds')
-  lockFunds(@Param('id') id: string) {
-    return this.escrowService.lockFunds(id);
-  }
+  // NOTE: There is intentionally NO public lock-funds route.
+  // Funds are locked exclusively by the Paystack webhook after
+  // payment is confirmed. This prevents anyone from faking a payment.
 
   @Patch(':id/release-tranche1')
   releaseTranche1(
@@ -59,16 +66,28 @@ export class EscrowController {
   }
 
   @Patch(':id/initiate-handshake')
-  initiateHandshake(
+  async initiateHandshake(
     @Param('id') id: string,
     @Body() dto: InitiateHandshakeDto,
     @Request() req: AuthenticatedRequest,
   ) {
-    return this.escrowService.initiateHandshake(
+    const result = await this.escrowService.initiateHandshake(
       id,
       req.user.userId,
       dto.proofOfWorkUrls,
     );
+
+    // The PIN is returned here so it can be forwarded to the client
+    // via SMS/push notification (to be wired up with the notifications module).
+    // We strip it from the response the artisan sees — they should never see it.
+    // For now we return it in the response; the notifications layer will own delivery.
+    return {
+      message: result.message,
+      expiresAt: result.expiresAt,
+      // TODO: remove pin from response once SMS/push notification is live.
+      // For now this is the only way the client receives it.
+      clientPin: result.pin,
+    };
   }
 
   @Patch(':id/verify-handshake')

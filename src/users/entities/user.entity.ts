@@ -9,6 +9,8 @@ import {
 export enum UserRole {
   CLIENT = 'client',
   ARTISAN = 'artisan',
+  ADMIN = 'admin',
+  SUPER_ADMIN = 'super_admin',
 }
 
 @Entity()
@@ -28,11 +30,34 @@ export class User {
   @Column({ nullable: true })
   phoneNumber: string;
 
+  @Column({ default: false })
+  phoneVerified: boolean;
+
+  @Column({ nullable: true })
+  residentialAddress: string;
+
   @Column({ type: 'enum', enum: UserRole, default: UserRole.CLIENT })
   role: UserRole;
 
   @Column({ default: false })
   isVerified: boolean;
+
+  // Tark certification badge (e.g. "Tark Certified Artisan")
+  @Column({ default: false })
+  isCertifiedByTark: boolean;
+
+  @Column({ nullable: true })
+  certificationBadgeTitle: string;
+
+  // Reputation metrics
+  @Column({ type: 'decimal', precision: 3, scale: 2, default: 0.0 })
+  averageRating: number;
+
+  @Column({ default: 0 })
+  totalReviewsCount: number;
+
+  @Column({ default: 0 })
+  completedJobsCount: number;
 
   @Column('text', { array: true, default: '{}' })
   skills: string[];

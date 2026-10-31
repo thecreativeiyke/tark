@@ -1,0 +1,147 @@
+import {
+  Injectable,
+  NotFoundException,
+  BadRequestException,
+  ForbiddenException,
+} from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository } from 'typeorm';
+import { Review, ReviewStatus } from './entities/review.entity';
+import { CreateReviewDto } from './dto/create-review.dto';
+import { ModerateReviewDto } from './dto/moderate-review.dto';
+import { Job, JobStatus } from '../jobs/entities/job.entity';
+import { User } from '../users/entities/user.entity';
+
+@Injectable()
+export class ReviewsService {
+  constructor(
+    @InjectRepository(Review)
+    private reviewsRepository: Repository<Review>,
+    @InjectRepository(Job)
+    private jobsRepository: Repository<Job>,
+    @InjectRepository(User)
+    private usersRepository: Repository<User>,
+  ) {}
+
+  // ─────────────────────────────────────────────────────────────────────
+  // SUBMIT REVIEW: Client rates the artisan upon job completion.
+  // Held in PENDING_REVIEW status until an administrator audits it.
+  // ─────────────────────────────────────────────────────────────────────
+  async create(createDto: CreateReviewDto, clientId: string) {
+    const job = await this.jobsRepository.findOneBy({ id: createDto.jobId });
+    if (!job) {
+      throw new NotFoundException('Job not found');
+    }
+
+    if (job.clientId !== clientId) {
+      throw new ForbiddenException('Only the client who posted this job can submit a review');
+    }
+
+    if (job.status !== JobStatus.COMPLETED) {
+      throw new BadRequestException('Reviews can only be submitted for COMPLETED jobs');
+    }
+
+    if (!job.artisanId) {
+      throw new BadRequestException('No artisan was assigned to this job');
+    }
+
+    const existing = await this.reviewsRepository.findOneBy({ jobId: job.id });
+    if (existing) {
+      throw new BadRequestException('A review has already been submitted for this job');
+    }
+
+    const review = this.reviewsRepository.create({
+      jobId: job.id,
+      clientId,
+      artisanId: job.artisanId,
+      rating: createDto.rating,
+      comment: createDto.comment,
+      proofMediaUrls: createDto.proofMediaUrls || [],
+      status: ReviewStatus.PENDING_REVIEW,
+    });
+
+    const saved = await this.reviewsRepository.save(review);
+
+    return {
+      message:
+        'Thank you! Your review has been submitted to the Tark administrative moderation desk. It will be made public once approved.',
+      reviewId: saved.id,
+      status: saved.status,
+    };
+  }
+
+  // ─────────────────────────────────────────────────────────────────────
+  // PUBLIC ARTISAN REVIEWS: Anyone can see verified, approved reviews.
+  // ─────────────────────────────────────────────────────────────────────
+  async getPublicArtisanReviews(artisanId: string) {
+    return this.reviewsRepository.find({
+      where: {
+        artisanId,
+        status: ReviewStatus.APPROVED,
+      },
+      order: { createdAt: 'DESC' },
+    });
+  }
+
+  // ─────────────────────────────────────────────────────────────────────
+  // ADMIN: Get queue of pending reviews awaiting administrative check
+  // ─────────────────────────────────────────────────────────────────────
+  async getPendingReviews() {
+    return this.reviewsRepository.find({
+      where: { status: ReviewStatus.PENDING_REVIEW },
+      order: { createdAt: 'ASC' },
+    });
+  }
+
+  // ─────────────────────────────────────────────────────────────────────
+  // ADMIN: Moderate (Approve / Reject) with notes
+  // ─────────────────────────────────────────────────────────────────────
+  async moderateReview(
+    reviewId: string,
+    dto: ModerateReviewDto,
+    adminId: string,
+  ) {
+    const review = await this.reviewsRepository.findOneBy({ id: reviewId });
+    if (!review) {
+      throw new NotFoundException('Review not found');
+    }
+
+    review.status = dto.status;
+    review.adminNotes = dto.adminNotes || null;
+    review.moderatedBy = adminId;
+    review.moderatedAt = new Date();
+
+    const savedReview = await this.reviewsRepository.save(review);
+
+    // If approved, update the artisan's average rating and total count
+    if (dto.status === ReviewStatus.APPROVED) {
+      await this.recalculateArtisanMetrics(review.artisanId);
+    }
+
+    return {
+      message: `Review #${review.id} has been ${dto.status.toLowerCase()} by admin.`,
+      review: savedReview,
+    };
+  }
+
+  // Recalculates cumulative average score and count on the artisan's profile
+  private async recalculateArtisanMetrics(artisanId: string) {
+    const result = await this.reviewsRepository
+      .createQueryBuilder('review')
+      .select('AVG(review.rating)', 'avgRating')
+      .addSelect('COUNT(review.id)', 'totalReviews')
+      .where('review.artisanId = :artisanId', { artisanId })
+      .andWhere('review.status = :status', { status: ReviewStatus.APPROVED })
+      .getRawOne();
+
+    const avg = result?.avgRating ? parseFloat(Number(result.avgRating).toFixed(2)) : 0.0;
+    const count = result?.totalReviews ? parseInt(result.totalReviews, 10) : 0;
+
+    const artisan = await this.usersRepository.findOneBy({ id: artisanId });
+    if (artisan) {
+      artisan.averageRating = avg;
+      artisan.totalReviewsCount = count;
+      await this.usersRepository.save(artisan);
+    }
+  }
+}

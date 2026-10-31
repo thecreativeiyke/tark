@@ -4,8 +4,8 @@ import {
   BadRequestException,
   ForbiddenException,
 } from '@nestjs/common';
-import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { InjectRepository, InjectDataSource } from '@nestjs/typeorm';
+import { Repository, DataSource } from 'typeorm';
 import { Bid, BidStatus } from './entities/bid.entity';
 import { CreateBidDto } from './dto/create-bid.dto';
 import { JobsService } from '../jobs/jobs.service';
@@ -17,33 +17,45 @@ export class BidsService {
   constructor(
     @InjectRepository(Bid)
     private bidsRepository: Repository<Bid>,
+    @InjectDataSource()
+    private dataSource: DataSource,
     private jobsService: JobsService,
     private escrowService: EscrowService,
   ) {}
 
   async create(dto: CreateBidDto, artisanId: string, role: string) {
     if (role !== 'artisan') {
-      throw new ForbiddenException('Only registered artisans can place bids on jobs');
+      throw new ForbiddenException('Only registered artisans can place bids');
     }
 
     const job = await this.jobsService.findOne(dto.jobId);
+
+    // An artisan cannot bid on their own posted job
+    if (job.clientId === artisanId) {
+      throw new ForbiddenException('You cannot bid on your own job posting');
+    }
+
     if (job.status !== JobStatus.OPEN) {
       throw new BadRequestException('Cannot bid on a job that is not OPEN');
     }
 
     const trancheSum = Number(dto.tranche1Amount) + Number(dto.tranche2Amount);
     if (Math.round(trancheSum) !== Math.round(Number(dto.amount))) {
-      throw new BadRequestException('The sum of Tranche 1 and Tranche 2 must equal the total bid amount');
+      throw new BadRequestException(
+        'Tranche 1 + Tranche 2 must add up exactly to the total bid amount',
+      );
     }
 
-    // Check for existing pending bid from this artisan
+    // One pending bid per artisan per job
     const existing = await this.bidsRepository.findOneBy({
       jobId: dto.jobId,
       artisanId,
       status: BidStatus.PENDING,
     });
     if (existing) {
-      throw new BadRequestException('You already have a pending bid on this job. Withdraw or update it instead.');
+      throw new BadRequestException(
+        'You already have a pending bid on this job. Withdraw it first if you want to rebid.',
+      );
     }
 
     const bid = this.bidsRepository.create({
@@ -69,60 +81,70 @@ export class BidsService {
     return bid;
   }
 
+  // ─────────────────────────────────────────────────────────────────────
+  // ACCEPT BID — runs inside a transaction so all-or-nothing:
+  // mark accepted, reject others, update job, create escrow.
+  // If any step fails the entire thing rolls back cleanly.
+  // ─────────────────────────────────────────────────────────────────────
   async acceptBid(bidId: string, clientId: string) {
     const bid = await this.findOne(bidId);
+
     if (bid.status !== BidStatus.PENDING) {
-      throw new BadRequestException(`Cannot accept a bid with status ${bid.status}`);
+      throw new BadRequestException(`Cannot accept a bid with status: ${bid.status}`);
     }
 
     const job = await this.jobsService.findOne(bid.jobId);
+
     if (job.clientId !== clientId) {
-      throw new ForbiddenException('Only the client who created the job can accept bids');
+      throw new ForbiddenException('Only the job owner can accept bids');
     }
 
     if (job.status !== JobStatus.OPEN) {
-      throw new BadRequestException('Job is no longer open for bid acceptance');
+      throw new BadRequestException('This job is no longer open for bid acceptance');
     }
 
-    // 1. Mark this bid ACCEPTED
-    bid.status = BidStatus.ACCEPTED;
-    await this.bidsRepository.save(bid);
+    // Run all writes atomically
+    return this.dataSource.transaction(async (manager) => {
+      // 1. Accept this bid
+      bid.status = BidStatus.ACCEPTED;
+      await manager.save(Bid, bid);
 
-    // 2. Reject all other pending bids for this job
-    await this.bidsRepository
-      .createQueryBuilder()
-      .update(Bid)
-      .set({ status: BidStatus.REJECTED })
-      .where('jobId = :jobId AND id != :bidId AND status = :status', {
-        jobId: job.id,
-        bidId: bid.id,
-        status: BidStatus.PENDING,
-      })
-      .execute();
+      // 2. Reject every other pending bid for this job
+      await manager
+        .createQueryBuilder()
+        .update(Bid)
+        .set({ status: BidStatus.REJECTED })
+        .where('jobId = :jobId AND id != :bidId AND status = :status', {
+          jobId: job.id,
+          bidId: bid.id,
+          status: BidStatus.PENDING,
+        })
+        .execute();
 
-    // 3. Bind artisan and agreed financial milestones to the Job
-    job.artisanId = bid.artisanId;
-    job.budget = bid.amount;
-    job.tranche1Amount = bid.tranche1Amount;
-    job.tranche2Amount = bid.tranche2Amount;
-    await this.jobsService.update(job.id, job, clientId);
+      // 3. Bind artisan and finalized amounts to the job
+      job.artisanId = bid.artisanId;
+      job.budget = bid.amount;
+      job.tranche1Amount = bid.tranche1Amount;
+      job.tranche2Amount = bid.tranche2Amount;
+      await manager.save(job);
 
-    // 4. Automatically generate the initial Escrow Transaction
-    const escrow = await this.escrowService.create(
-      {
-        jobId: job.id,
-        artisanId: bid.artisanId,
-        tranche1Amount: Number(bid.tranche1Amount),
-        tranche2Amount: Number(bid.tranche2Amount),
-      },
-      clientId,
-    );
+      // 4. Create the escrow — this will also enforce the one-escrow-per-job rule
+      const escrow = await this.escrowService.create(
+        {
+          jobId: job.id,
+          artisanId: bid.artisanId,
+          tranche1Amount: Number(bid.tranche1Amount),
+          tranche2Amount: Number(bid.tranche2Amount),
+        },
+        clientId,
+      );
 
-    return {
-      message: 'Bid accepted successfully. Escrow initialized.',
-      bid,
-      escrow,
-    };
+      return {
+        message: 'Bid accepted. Escrow created and ready for funding.',
+        bid,
+        escrow,
+      };
+    });
   }
 
   async withdraw(bidId: string, artisanId: string) {

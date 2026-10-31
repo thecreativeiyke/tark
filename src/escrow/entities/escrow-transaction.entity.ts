@@ -4,6 +4,7 @@ import {
   PrimaryGeneratedColumn,
   CreateDateColumn,
   UpdateDateColumn,
+  Index,
 } from 'typeorm';
 
 export enum EscrowStatus {
@@ -27,6 +28,8 @@ export class EscrowTransaction {
   @PrimaryGeneratedColumn('uuid')
   id: string;
 
+  // One escrow per job — enforced at DB level too
+  @Index({ unique: true })
   @Column()
   jobId: string;
 
@@ -44,6 +47,10 @@ export class EscrowTransaction {
 
   @Column({ type: 'decimal', precision: 10, scale: 2 })
   tranche2Amount: number;
+
+  // Platform service fee — deducted from artisan payout
+  @Column({ type: 'decimal', precision: 10, scale: 2, default: 0 })
+  platformFeeAmount: number;
 
   @Column({
     type: 'enum',
@@ -69,14 +76,26 @@ export class EscrowTransaction {
   @Column({ nullable: true })
   paystackReference: string;
 
+  // Transfer references — so we know exactly what Paystack paid and when
+  @Column({ type: 'varchar', nullable: true })
+  tranche1TransferRef: string | null;
+
+  @Column({ type: 'varchar', nullable: true })
+  tranche2TransferRef: string | null;
+
   @Column('text', { array: true, nullable: true })
   proofOfWorkUrls: string[];
 
+  // PIN is stored hashed in future; for now nullable varchar
   @Column({ type: 'varchar', length: 6, nullable: true })
   handshakePin: string | null;
 
   @Column({ type: 'timestamp', nullable: true })
   handshakeExpiresAt: Date | null;
+
+  // Tracks failed PIN attempts — locks out after MAX_PIN_ATTEMPTS
+  @Column({ default: 0 })
+  handshakePinAttempts: number;
 
   @CreateDateColumn()
   createdAt: Date;
