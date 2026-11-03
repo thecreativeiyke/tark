@@ -32,10 +32,11 @@ export class SmsChannel {
     const provider = (this.configService.get<string>('SMS_PROVIDER') || 'mock').toLowerCase();
     const formattedPhone = this.formatPhoneNumber(options.to);
 
-    // Level 2: Termii Real Dispatch (Sandbox or Live)
+    // Level 2: Termii Real Dispatch (Live / Sandbox)
     if (provider === 'termii') {
       const apiKey = this.configService.get<string>('TERMII_API_KEY');
-      const senderId = this.configService.get<string>('TERMII_SENDER_ID') || 'Tark';
+      const senderId = this.configService.get<string>('TERMII_SENDER_ID') || 'N-Alert';
+      const channel = this.configService.get<string>('TERMII_CHANNEL') || 'dnd';
 
       if (apiKey && !apiKey.includes('placeholder')) {
         try {
@@ -44,24 +45,50 @@ export class SmsChannel {
             from: senderId,
             sms: options.message,
             type: 'plain',
-            channel: 'generic',
+            channel,
             api_key: apiKey,
           };
 
           const res = await axios.post('https://api.ng.termii.com/api/sms/send', payload, {
             headers: { 'Content-Type': 'application/json' },
-            timeout: 8000,
+            timeout: 10000,
           });
 
           this.logger.log(
-            `[SMS Delivered] Termii API dispatched to ${formattedPhone} (ID: ${res.data?.message_id || 'ok'})`,
+            `[SMS Delivered] Termii API dispatched to ${formattedPhone} via ${channel} channel (ID: ${res.data?.message_id || 'ok'})`,
           );
           return { success: true, provider: 'termii', messageId: res.data?.message_id };
         } catch (err: any) {
           const errDetail = err.response?.data?.message || err.message;
           this.logger.warn(
-            `[SMS Fallback] Termii dispatch failed (${errDetail}). Falling back to Level 1 console mock...`,
+            `[Termii Dispatch Failed] Attempt with sender '${senderId}' and channel '${channel}' failed: ${errDetail}. Attempting DND fallback with 'N-Alert'...`,
           );
+
+          // Retry fallback: DND channel with default N-Alert sender
+          try {
+            const fallbackRes = await axios.post(
+              'https://api.ng.termii.com/api/sms/send',
+              {
+                to: formattedPhone,
+                from: 'N-Alert',
+                sms: options.message,
+                type: 'plain',
+                channel: 'dnd',
+                api_key: apiKey,
+              },
+              { headers: { 'Content-Type': 'application/json' }, timeout: 10000 },
+            );
+
+            this.logger.log(
+              `[SMS Delivered] Termii DND fallback successfully dispatched to ${formattedPhone} (ID: ${fallbackRes.data?.message_id})`,
+            );
+            return { success: true, provider: 'termii', messageId: fallbackRes.data?.message_id };
+          } catch (retryErr: any) {
+            const retryDetail = retryErr.response?.data?.message || retryErr.message;
+            this.logger.warn(
+              `[SMS Fallback Triggered] Termii retry also failed (${retryDetail}). Falling back to Level 1 console mock...`,
+            );
+          }
         }
       } else {
         this.logger.warn('TERMII_API_KEY is not configured. Falling back to Level 1 console mock.');
