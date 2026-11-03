@@ -10,6 +10,7 @@ import {
   UseGuards,
   ParseUUIDPipe,
 } from '@nestjs/common';
+import { Throttle } from '@nestjs/throttler';
 import { SupportService } from './support.service';
 import { CreateTicketDto } from './dto/create-ticket.dto';
 import { SendMessageDto } from './dto/send-message.dto';
@@ -33,15 +34,15 @@ export class SupportController {
   // POST /support/chat
   // Any logged-in user opens (or continues) a support session
   // ─────────────────────────────────────────────────────────────────────────────
+  // Protected from AI quota exhaustion: max 15 requests per minute
+  @Throttle({ default: { limit: 15, ttl: 60000 } })
   @Post('chat')
   createOrGetTicket(@Body() dto: CreateTicketDto, @Req() req: any) {
     return this.supportService.createOrGetTicket(dto, req.user.userId);
   }
 
-  // ─────────────────────────────────────────────────────────────────────────────
-  // POST /support/:ticketId/message
-  // Send a follow-up message on an existing ticket
-  // ─────────────────────────────────────────────────────────────────────────────
+  // Protected from AI quota exhaustion: max 15 requests per minute
+  @Throttle({ default: { limit: 15, ttl: 60000 } })
   @Post(':ticketId/message')
   sendMessage(
     @Param('ticketId', ParseUUIDPipe) ticketId: string,

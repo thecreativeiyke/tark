@@ -11,6 +11,7 @@ import {
   UseGuards,
   Request,
 } from '@nestjs/common';
+import { SkipThrottle, Throttle } from '@nestjs/throttler';
 import { PaymentsService } from './payments.service';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 
@@ -27,6 +28,8 @@ interface AuthenticatedRequest {
 export class PaymentsController {
   constructor(private readonly paymentsService: PaymentsService) {}
 
+  // Public lookup that calls the payment gateway: tighter than the global limit
+  @Throttle({ default: { limit: 30, ttl: 60000 } })
   @Get('banks')
   getSupportedBanks(
     @Query('country') country?: string,
@@ -108,6 +111,9 @@ export class PaymentsController {
     return this.paymentsService.assignDedicatedVirtualAccount(req.user.userId);
   }
 
+  // Server-to-server call from Paystack: protected by HMAC signature verification,
+  // and must never be rate-limited or a legitimate payment event could be dropped.
+  @SkipThrottle()
   @Post('webhook')
   handleWebhook(
     @Headers('x-paystack-signature') signature: string,

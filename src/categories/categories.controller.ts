@@ -7,6 +7,7 @@ import {
   Body,
   Param,
   UseGuards,
+  Header,
   ParseUUIDPipe,
 } from '@nestjs/common';
 import { CategoriesService } from './categories.service';
@@ -26,6 +27,7 @@ export class CategoriesController {
   // ─────────────────────────────────────────────────────────────────────────────
 
   @Get()
+  @Header('Cache-Control', 'public, max-age=3600, stale-while-revalidate=86400')
   findAll() {
     return this.categoriesService.findAllActive();
   }

@@ -16,6 +16,7 @@ Every engineer (human or AI agent) **must review these records** before proposin
 | [ADR 002](./002-in-app-wallet-refunds-and-non-refundable-fees.md) | In-App Wallet Client Refunds & Non-Refundable Protocol Fee | **ACCEPTED** | 2026-10-31 |
 | [ADR 003](./003-mandatory-r2-proof-of-work-and-pin-security.md) | Mandatory Cloudflare R2 Proof-of-Work & PIN Confidentiality | **ACCEPTED** | 2026-10-31 |
 | [ADR 004](./004-ai-first-customer-support-and-triage-desk.md) | AI-First Customer Support & Triage Desk (Gemini 3.5 Flash) | **ACCEPTED** | 2026-11-03 |
+| [ADR 005](./005-three-ring-security-shield.md) | Three-Ring Security Shield for Public Endpoints | **ACCEPTED** | 2026-11-03 |
 
 ---
 

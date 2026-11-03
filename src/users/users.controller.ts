@@ -8,6 +8,7 @@ import {
   Request,
   ParseFloatPipe,
 } from '@nestjs/common';
+import { Throttle } from '@nestjs/throttler';
 import { UsersService } from './users.service';
 import { UpdateProfileDto } from './dto/update-profile.dto';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
@@ -33,6 +34,8 @@ export class UsersController {
     return this.usersService.updateProfile(req.user.userId, updateProfileDto);
   }
 
+  // Public geo query: tighter than the global limit to deter scraping of artisan locations
+  @Throttle({ default: { limit: 30, ttl: 60000 } })
   @Get('artisans/nearby')
   findNearbyArtisans(
     @Query('lat', ParseFloatPipe) lat: number,

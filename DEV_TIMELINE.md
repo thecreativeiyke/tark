@@ -25,6 +25,59 @@
 
 ## 🗓️ Session Log
 
+### 🗓️ 2026-11-03 — Session 7: Three-Ring Shield — Full End-to-End Verification & Push
+- **Author**: Lead Engineer (AI Model: Gemini / Antigravity) & Ikechukwu Alaeto (Founder)
+- **Tag**: `[AUDIT]` `[SHIPPED]` — Closed out the Three-Ring Shield work started in Sessions 5–6.
+
+#### What Was Done:
+1. **Read all files Claude wrote** (`payments.controller.ts`, `users.controller.ts`, `main.ts`, `docs/adr/005*`, `DEV_TIMELINE.md`) — all confirmed correct and consistent.
+2. **TypeScript compile** (`tsc --noEmit`): exit 0, zero errors. ✅
+3. **NestJS build** (`nest build`): exit 0, clean. ✅
+4. **Server boot**: `Nest application successfully started` on port 3000, all routes mapped, Supabase connected. ✅
+5. **Ring 1 verified** — `GET /categories` returns full Helmet header suite: `Strict-Transport-Security`, `X-Frame-Options: SAMEORIGIN`, `Content-Security-Policy`, `X-Content-Type-Options: nosniff`, `Referrer-Policy`, `Cross-Origin-Opener-Policy`. ✅
+6. **Ring 2 verified** — `POST /auth/login` hammered 12 times: requests 1–10 → `401`, requests 11–12 → `429 Too Many Requests`. ✅
+7. **Ring 3 verified** — `Cache-Control: public, max-age=3600, stale-while-revalidate=86400` + Express weak `ETag` present on `GET /categories`. ✅
+8. **DEV_TIMELINE Session 6 verification block** updated from PENDING → COMPLETE. ✅
+9. **Committed and pushed** all Three-Ring Shield changes to `main`. ✅
+
+#### Next Up (Team Decision Pending):
+- **Option A**: Multi-Channel Notifications Engine (Termii SMS + FCM Push + Email fallback)
+- **Option B**: Artisan KYC & Verification Desk (NIN/BVN upload → admin review → Certified badge)
+- **Option C**: In-Job Real-Time Chat (Socket.IO gateway, client ↔ artisan)
+
+---
+
+### 🗓️ 2026-11-03 — Session 6: Three-Ring Security Shield (Public Endpoint Hardening)
+- **Author**: Lead Engineer (AI Model: Claude) & Ikechukwu Alaeto (Founder)
+- **Tag**: `[SHIPPED]` & `[AUDIT]` & `[DECISION]` — full rationale in [ADR 005](./docs/adr/005-three-ring-security-shield.md)
+
+#### What Was Done:
+1. **Ring 1, Helmet**: `app.use(helmet())` in `src/main.ts` (OWASP security headers).
+2. **Ring 2, Rate limiting**: Global `ThrottlerGuard` at 60 req/min/IP; `/auth/register` and `/auth/login` at 10/min; `POST /support/chat` and `POST /support/:ticketId/message` at 15/min to protect the Gemini quota.
+3. **Ring 3, Caching**: `Cache-Control: public, max-age=3600, stale-while-revalidate=86400` on `GET /categories` (Express supplies the ETag).
+4. Packages `helmet@8.3.0` and `@nestjs/throttler@6.7.1` confirmed installed.
+
+#### ⚠️ Gaps Found in Audit & Fixed:
+1. **No proxy awareness**: Per-IP limits would collapse into one shared bucket behind a reverse proxy. `main.ts` now sets Express `trust proxy` from the new `TRUST_PROXY_HOPS` env var (documented in `.env.example`). **Must be set in production.**
+2. **Paystack webhook under global limit**: `POST /payments/webhook` now has `@SkipThrottle()`; the HMAC signature check remains its protection.
+3. **Heavy public endpoints**: `GET /payments/banks` and `GET /users/artisans/nearby` now limited to 30 req/min.
+4. **Plan vs code drift**: The original proposal said 100/min global, "5 failed logins" and a 24h cache. Actual values (60/min, 10 requests/min counting all attempts, 1h fresh + 24h stale-while-revalidate) are now the documented source of truth in ADR 005.
+
+#### 🧪 Verification — COMPLETE ✅ (Session 7 — Gemini, 2026-11-03):
+- **TypeScript compile** (`tsc --noEmit`): exit 0, zero errors. ✅
+- **NestJS build** (`nest build`): exit 0, clean. ✅
+- **Server boot**: `Nest application successfully started` on port 3000, all routes mapped. ✅
+- **Ring 1 — Helmet headers on `GET /categories`**: `Strict-Transport-Security`, `X-Frame-Options: SAMEORIGIN`, `Content-Security-Policy`, `X-Content-Type-Options: nosniff`, `Referrer-Policy`, `Origin-Agent-Cluster` all present. ✅
+- **Ring 2 — Rate limiting on `POST /auth/login`**: Requests 1–10 → `401 Unauthorized` (correct credentials rejected by auth); requests 11 & 12 → `429 Too Many Requests`. ✅
+- **Ring 3 — Cache headers on `GET /categories`**: `Cache-Control: public, max-age=3600, stale-while-revalidate=86400` + `ETag: W/"5f3-..."` (Express weak ETag). ✅
+- **Rate-limit headers exposed**: `X-RateLimit-Limit: 60`, `X-RateLimit-Remaining: 59`, `X-RateLimit-Reset: 60` visible in responses. ✅
+
+#### 📌 Follow-ups:
+- Move throttler storage to Redis if Tark ever runs more than one instance (in-memory counters are per instance).
+- Set `TRUST_PROXY_HOPS` in the production environment before launch.
+
+---
+
 ### 🗓️ 2026-11-03 — Session 5: Peer-Review Hardening Pass (Claude Audit & Gemini Execution)
 - **Author**: Lead Engineers: Claude (Principal Code Audit) & Gemini (Fixes Implementation & Verification)
 - **Tag**: `[FLAGGED & FIXED]` & `[AUDIT]`

@@ -1,6 +1,8 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
+import { APP_GUARD } from '@nestjs/core';
+import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { UsersModule } from './users/users.module';
@@ -19,6 +21,17 @@ import { SupportModule } from './support/support.module';
   imports: [
     ConfigModule.forRoot({
       isGlobal: true,
+    }),
+    // Global rate limiting protection against DDoS, scraping, and brute force
+    ThrottlerModule.forRoot({
+      throttlers: [
+        {
+          name: 'default',
+          ttl: 60000, // 60 seconds window
+          limit: 60, // 60 requests per minute per IP
+        },
+      ],
+      errorMessage: 'Too many requests. Please slow down and try again shortly.',
     }),
     TypeOrmModule.forRootAsync({
       imports: [ConfigModule],
@@ -67,6 +80,12 @@ import { SupportModule } from './support/support.module';
     SupportModule,
   ],
   controllers: [AppController],
-  providers: [AppService],
+  providers: [
+    AppService,
+    {
+      provide: APP_GUARD,
+      useClass: ThrottlerGuard,
+    },
+  ],
 })
 export class AppModule {}
