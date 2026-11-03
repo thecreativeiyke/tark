@@ -1,124 +1,93 @@
-<p align="center">
-  <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /></a>
-</p>
+# 🛡️ Tark Backend API & Protocol Engine
 
-[circleci-image]: https://img.shields.io/circleci/build/github/nestjs/nest/master?token=abc123def456
-[circleci-url]: https://circleci.com/gh/nestjs/nest
+> The on-demand artisan service dispatch and escrow protocol platform.
 
-  <p align="center">A progressive <a href="http://nodejs.org" target="_blank">Node.js</a> framework for building efficient and scalable server-side applications.</p>
-    <p align="center">
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/v/@nestjs/core.svg" alt="NPM Version" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/l/@nestjs/core.svg" alt="Package License" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/dm/@nestjs/common.svg" alt="NPM Downloads" /></a>
-<a href="https://circleci.com/gh/nestjs/nest" target="_blank"><img src="https://img.shields.io/circleci/build/github/nestjs/nest/master" alt="CircleCI" /></a>
-<a href="https://discord.gg/G7Qnnhy" target="_blank"><img src="https://img.shields.io/badge/discord-online-brightgreen.svg" alt="Discord"/></a>
-<a href="https://opencollective.com/nest#backer" target="_blank"><img src="https://opencollective.com/nest/backers/badge.svg" alt="Backers on Open Collective" /></a>
-<a href="https://opencollective.com/nest#sponsor" target="_blank"><img src="https://opencollective.com/nest/sponsors/badge.svg" alt="Sponsors on Open Collective" /></a>
-  <a href="https://paypal.me/kamilmysliwiec" target="_blank"><img src="https://img.shields.io/badge/Donate-PayPal-ff3f59.svg" alt="Donate us"/></a>
-    <a href="https://opencollective.com/nest#sponsor"  target="_blank"><img src="https://img.shields.io/badge/Support%20us-Open%20Collective-41B883.svg" alt="Support us"></a>
-  <a href="https://twitter.com/nestframework" target="_blank"><img src="https://img.shields.io/twitter/follow/nestframework.svg?style=social&label=Follow" alt="Follow us on Twitter"></a>
-</p>
-  <!--[![Backers on Open Collective](https://opencollective.com/nest/backers/badge.svg)](https://opencollective.com/nest#backer)
-  [![Sponsors on Open Collective](https://opencollective.com/nest/sponsors/badge.svg)](https://opencollective.com/nest#sponsor)-->
+Tark connects clients with verified, skilled local artisans (electricians, plumbers, carpenters, solar technicians, mechanics, etc.) through a fraud-resistant, two-tranche escrow guarantee protocol (**Tark Safe-Lock**), cryptographic completion handshakes, mandatory photo proof-of-work, and intelligent AI-powered support and dispute triage.
 
-## Description
+---
 
-[Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
+## 📖 Essential Reading for Developers
 
-## Project setup
+All engineers working on this codebase **must** read and adhere to our engineering principles and security rules:
 
-```bash
-$ npm install
+👉 **[Read the Tark Engineering Manifesto & Developer Guide (ENGINEERING_GUIDE.md)](./ENGINEERING_GUIDE.md)**
+
+It covers:
+- The Tark engineering mindset: Zero money leakage, defense-in-depth, paranoid security.
+- Plain-language terminology dictionary for frontend vs backend.
+- The 10 Commandments of Tark Engineering (pessimistic locking, transaction safety, PIN secrecy, payout idempotency).
+- Architecture diagram and database conventions.
+
+---
+
+## ⚡ Tech Stack
+
+- **Runtime & Framework**: Node.js + [NestJS](https://nestjs.com/) (TypeScript)
+- **Database**: PostgreSQL 16 managed via [Supabase](https://supabase.com/) (AWS London `eu-west-2` pooler) with [TypeORM](https://typeorm.io/)
+- **Media & Proof-of-Work Storage**: [Cloudflare R2](https://www.cloudflare.com/products/r2/) accessed via [`iyke-storage`](https://www.npmjs.com/package/iyke-storage) gateway
+- **Payments & Transfers**: [Paystack](https://paystack.com/) (Cards, Bank Transfer, Dedicated Virtual Accounts, NUBAN resolution)
+- **AI Triage & Case Summarization**: [Google Gemini 3.5 Flash](https://ai.google.dev/) via Google AI Studio API
+- **Authentication**: JWT with Role-Based Access Control (`CLIENT`, `ARTISAN`, `ADMIN`, `SUPER_ADMIN`)
+
+---
+
+## 🔄 Core Protocol Flow
+
+```
+1. Client Posts Job ────► 2. Artisans Submit Bids ────► 3. Client Accepts Bid
+                                                                   │
+4. Funds Released (Tranche 1) ◄── Funds Locked in Safe-Lock ◄──────┘
+   (Start-Work Mobilization)
+         │
+         ▼
+5. Artisan Executes Work & Uploads Mandatory Proof-of-Work Photos (Cloudflare R2)
+         │
+         ▼
+6. Artisan Initiates Handshake ────► 7. Client Reviews Work & Shares 6-Digit Completion Code
+                                                                   │
+8. Final Payout (Tranche 2) Released to Artisan ◄──────────────────┘
+         │
+         ▼
+9. Client Leaves Review ────► Review Moderation Desk ────► Public Artisan Rating
 ```
 
-## Compile and run the project
+---
 
+## 🛠️ Quick Start
+
+### 1. Setup Environment
 ```bash
-# development
-$ npm run start
+cp .env.example .env
+```
+Configure your `.env` variables with your PostgreSQL connection, Paystack test keys, Cloudflare R2 credentials, and Google Gemini API key.
 
-# watch mode
-$ npm run start:dev
-
-# production mode
-$ npm run start:prod
+### 2. Install Dependencies
+```bash
+npm install
 ```
 
-## Run tests
-
+### 3. Build & Run
 ```bash
-# unit tests
-$ npm run test
+# Compile TypeScript
+npm run build
 
-# e2e tests
-$ npm run test:e2e
-
-# test coverage
-$ npm run test:cov
+# Start server in watch mode
+npm run start:dev
 ```
 
-## Deployment
+Server will be running at `http://localhost:3000`.
 
-When you're ready to deploy your NestJS application to production, there are some key steps you can take to ensure it runs as efficiently as possible. Check out the [deployment documentation](https://docs.nestjs.com/deployment) for more information.
+---
 
-If you are looking for a cloud-based platform to deploy your NestJS application, check out [Mau](https://mau.nestjs.com), our official platform for deploying NestJS applications on AWS. Mau makes deployment straightforward and fast, requiring just a few simple steps:
+## 🔒 Security Best Practices
 
-```bash
-$ npm install -g @nestjs/mau
-$ mau deploy
-```
+- **Never commit `.env`**: Credentials, database strings, and API secrets must never touch version control.
+- **Transactions & Row Locking**: Any balance change or escrow state transition must run inside a database transaction with pessimistic row locking (`SELECT FOR UPDATE`).
+- **PIN Confidentiality**: Handshake completion PINs are only returned to the client and never exposed to the artisan's API responses.
 
-With Mau, you can deploy your application in just a few clicks, allowing you to focus on building features rather than managing infrastructure.
+---
 
-## Observability
+## 👥 Contributors & Maintainers
 
-In production applications, observability is essential for understanding how your system behaves, detecting issues early, and maintaining reliable performance.
-
-[NestJS Observe](https://observe.nestjs.com) automatically instruments your NestJS application, giving you deep visibility into your system with minimal setup:
-
-- **Distributed tracing:** Follow requests across services and understand how they flow through your system.
-- **Waterfall analysis:** Visualize request execution and identify slow operations, bottlenecks, and unexpected delays.
-- **Performance analysis:** Analyze application performance in real time and quickly pinpoint areas that need optimization.
-- **Metrics:** Track key application and infrastructure metrics to understand system health and performance trends.
-- **Logging:** Centralize and correlate logs with traces and other telemetry to make debugging easier.
-- **Error tracking:** Detect errors quickly and investigate their root causes with the surrounding context.
-- **SLA monitoring:** Track service-level objectives and identify when your application is approaching or exceeding defined thresholds.
-- **Alarms and alerts:** Set up alerts for critical errors, performance degradation, SLA violations, and other anomalies so your team can react quickly.
-
-To add it to this project:
-
-```bash
-$ npm install @nestjs/observe
-```
-
-Then follow the [setup guide](https://docs.nestjs.com/observability/overview) - it takes a single import and an app key.
-
-The free plan needs no payment details and covers 300,000 events a month. You can also browse the [live demo](https://www.observe-demo.nestjs.com/dashboard) first - the whole dashboard over a busy service's data, with nothing to install.
-
-## Resources
-
-Check out a few resources that may come in handy when working with NestJS:
-
-- Visit the [NestJS Documentation](https://docs.nestjs.com) to learn more about the framework.
-- For questions and support, please visit our [Discord channel](https://discord.gg/G7Qnnhy).
-- To dive deeper and get more hands-on experience, check out our official video [courses](https://courses.nestjs.com/).
-- Deploy your application to AWS with the help of [NestJS Mau](https://mau.nestjs.com) in just a few clicks.
-- Auto-instrument your application with [NestJS Observe](https://observe.nestjs.com). Distributed tracing, metrics, and logging made easy. Error tracking and performance monitoring for your NestJS applications.
-- Visualize your application graph and interact with the NestJS application in real-time using [NestJS Devtools](https://devtools.nestjs.com).
-- Need help with your project (part-time to full-time)? Check out our official [enterprise support](https://enterprise.nestjs.com).
-- To stay in the loop and get updates, follow us on [X](https://x.com/nestframework) and [LinkedIn](https://linkedin.com/company/nestjs).
-- Looking for a job, or have a job to offer? Check out our official [Jobs board](https://jobs.nestjs.com).
-
-## Support
-
-Nest is an MIT-licensed open source project. It can grow thanks to the sponsors and support by the amazing backers. If you'd like to join them, please [read more here](https://docs.nestjs.com/support).
-
-## Stay in touch
-
-- Author - [Kamil Myśliwiec](https://twitter.com/kammysliwiec)
-- Website - [https://nestjs.com](https://nestjs.com/)
-- Twitter - [@nestframework](https://twitter.com/nestframework)
-
-## License
-
-Nest is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
+- **Founder & Lead**: Ikechukwu Alaeto ([@thecreativeiyke](https://github.com/thecreativeiyke))
+- **License**: Private & Proprietary — Tark Platform
