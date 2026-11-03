@@ -57,6 +57,14 @@ export class PaymentsService {
     };
   }
 
+  // Sandbox simulation is OFF by default and can never be enabled in production.
+  private sandboxFallbackAllowed(): boolean {
+    return (
+      this.configService.get<string>('NODE_ENV') !== 'production' &&
+      this.configService.get<string>('PAYMENTS_SANDBOX_FALLBACK') === 'true'
+    );
+  }
+
   // Real-time Third-Party Bank API Directory
   async getSupportedBanks(filters: BankFilterQuery = {}) {
     const { country = 'nigeria', currency = 'NGN', type = 'nuban', search } = filters;
@@ -335,15 +343,26 @@ export class PaymentsService {
         const resolved = await gateway.resolveAccount(accountNumber, bankCode);
         resolvedName = resolved.accountName;
       } catch (err: any) {
-        this.logger.warn(`Bank resolution bypassed or failed in test mode: ${err.message}`);
+        if (!this.sandboxFallbackAllowed()) {
+          throw new BadRequestException(
+            'Could not verify this bank account. Check the account number and bank, then try again.',
+          );
+        }
+        this.logger.warn(`Bank resolution bypassed in sandbox mode: ${err.message}`);
       }
     }
 
-    let recipientCode = `RCP_${Date.now()}`;
+    let recipientCode: string;
     try {
       recipientCode = await gateway.createRecipient(resolvedName, accountNumber, bankCode, currency);
     } catch (err: any) {
-      this.logger.warn(`Recipient creation simulated: ${err.message}`);
+      if (!this.sandboxFallbackAllowed()) {
+        throw new BadRequestException(
+          'Could not register this payout account with the payment provider. Please try again.',
+        );
+      }
+      this.logger.warn(`Recipient creation simulated in sandbox mode: ${err.message}`);
+      recipientCode = `RCP_${Date.now()}`;
     }
 
     user.payoutAccountIdentifier = accountNumber;
@@ -435,6 +454,7 @@ export class PaymentsService {
     recipientCode: string,
     reason: string,
     currency = 'NGN',
+    reference?: string,
   ) {
     const gateway = this.gatewayResolver.resolveByCurrency(currency);
     return gateway.initiateTransfer({
@@ -442,6 +462,7 @@ export class PaymentsService {
       currency,
       recipientCode,
       reason,
+      reference,
     });
   }
 

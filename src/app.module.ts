@@ -13,6 +13,7 @@ import { MediaModule } from './media/media.module';
 import { BidsModule } from './bids/bids.module';
 import { ReviewsModule } from './reviews/reviews.module';
 import { DisputesModule } from './disputes/disputes.module';
+import { SupportModule } from './support/support.module';
 
 @Module({
   imports: [
@@ -63,6 +64,7 @@ import { DisputesModule } from './disputes/disputes.module';
     BidsModule,
     ReviewsModule,
     DisputesModule,
+    SupportModule,
   ],
   controllers: [AppController],
   providers: [AppService],

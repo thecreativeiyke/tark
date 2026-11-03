@@ -23,6 +23,9 @@ export interface TransferPayoutParams {
   currency: string;
   recipientCode: string;
   reason: string;
+  // Unique, deterministic reference so the provider rejects a duplicate payout
+  // for the same escrow tranche (idempotency).
+  reference?: string;
 }
 
 export interface TransferPayoutResult {

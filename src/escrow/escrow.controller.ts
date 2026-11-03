@@ -66,28 +66,19 @@ export class EscrowController {
   }
 
   @Patch(':id/initiate-handshake')
-  async initiateHandshake(
+  initiateHandshake(
     @Param('id') id: string,
     @Body() dto: InitiateHandshakeDto,
     @Request() req: AuthenticatedRequest,
   ) {
-    const result = await this.escrowService.initiateHandshake(
+    // The completion PIN is deliberately NOT returned here. The caller is the
+    // artisan, and the PIN exists to prove the CLIENT approved the work. The
+    // client reads it via GET /escrow/:id and gives it to the artisan in person.
+    return this.escrowService.initiateHandshake(
       id,
       req.user.userId,
       dto.proofOfWorkUrls,
     );
-
-    // The PIN is returned here so it can be forwarded to the client
-    // via SMS/push notification (to be wired up with the notifications module).
-    // We strip it from the response the artisan sees — they should never see it.
-    // For now we return it in the response; the notifications layer will own delivery.
-    return {
-      message: result.message,
-      expiresAt: result.expiresAt,
-      // TODO: remove pin from response once SMS/push notification is live.
-      // For now this is the only way the client receives it.
-      clientPin: result.pin,
-    };
   }
 
   @Patch(':id/verify-handshake')
@@ -103,11 +94,7 @@ export class EscrowController {
     );
   }
 
-  @Patch(':id/dispute')
-  dispute(
-    @Param('id') id: string,
-    @Request() req: AuthenticatedRequest,
-  ) {
-    return this.escrowService.dispute(id, req.user.userId);
-  }
+  // Disputes are opened via POST /disputes (DisputesModule), which records the
+  // case and routes it to the admin queue. There is intentionally no bare
+  // escrow-level dispute route.
 }
