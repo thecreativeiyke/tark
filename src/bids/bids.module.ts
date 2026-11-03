@@ -5,12 +5,14 @@ import { BidsService } from './bids.service';
 import { BidsController } from './bids.controller';
 import { JobsModule } from '../jobs/jobs.module';
 import { EscrowModule } from '../escrow/escrow.module';
+import { NotificationsModule } from '../notifications/notifications.module';
 
 @Module({
   imports: [
     TypeOrmModule.forFeature([Bid]),
     JobsModule,
     forwardRef(() => EscrowModule),
+    NotificationsModule,
   ],
   controllers: [BidsController],
   providers: [BidsService],

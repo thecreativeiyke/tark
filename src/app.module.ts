@@ -16,6 +16,7 @@ import { BidsModule } from './bids/bids.module';
 import { ReviewsModule } from './reviews/reviews.module';
 import { DisputesModule } from './disputes/disputes.module';
 import { SupportModule } from './support/support.module';
+import { NotificationsModule } from './notifications/notifications.module';
 
 @Module({
   imports: [
@@ -78,6 +79,7 @@ import { SupportModule } from './support/support.module';
     ReviewsModule,
     DisputesModule,
     SupportModule,
+    NotificationsModule,
   ],
   controllers: [AppController],
   providers: [

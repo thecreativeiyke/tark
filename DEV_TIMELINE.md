@@ -25,6 +25,43 @@
 
 ## 🗓️ Session Log
 
+### 🗓️ 2026-11-03 — Session 8: Multi-Channel Notifications Engine & Fallback Architecture
+- **Author**: Lead Engineer (AI Model: Gemini / Antigravity) & Ikechukwu Alaeto (Founder)
+- **Tag**: `[SHIPPED]` & `[AUDIT]` & `[DECISION]` — Full rationale in [ADR 006](./docs/adr/006-multi-channel-notifications-engine.md)
+
+#### What Was Done:
+1. **Architected & Implemented `NotificationsModule`**:
+   - `Notification` entity: in-app notification feed in PostgreSQL, indexed by `userId`, with read tracking (`isRead`, `readAt`).
+   - `PushSubscriptionEntity`: stores browser Web Push subscriptions (VAPID endpoint + p256dh/auth keys).
+   - `EmailChannel`: Resilient multi-provider email engine. Primary is Resend SDK (`resend`), with seamless automatic fallback to Nodemailer SMTP (using Gmail App password or custom SMTP server).
+   - `SmsChannel`: Two-tier SMS dispatcher. Level 1 console simulator for local dev/testing (`[SMS MOCK DISPATCH]`). Level 2 Termii API integration (`https://api.ng.termii.com/api/sms/send`) for real Nigerian network SMS dispatch.
+   - `WebPushChannel`: Custom RFC 8292 VAPID web push (no Firebase SDK lock-in). Stale subscriptions auto-pruned upon HTTP 410 Gone / 404.
+2. **Handcrafted Email & SMS Templates**:
+   - Designed 6 core protocol email templates with dark luxury aesthetic, brand headers, responsive container (max 580px), inlined CSS for full Gmail fidelity, and `<meta name="google" content="notranslate">`.
+   - Covered moments: `bidReceived`, `safeLockFunded`, `tranche1Released`, `handshakeReady` (with 4-digit code and physical inspection security notice), `payoutSettled` (with 5% fee deduction breakdown), and `disputeUpdate`.
+   - SMS templates: punchy, under 160 characters, with Nigerian currency formatting.
+3. **Full Protocol Lifecycle Wire-Up**:
+   - `BidsService.create()`: Asynchronously dispatches `notifyBidReceived` to the client.
+   - `EscrowService.lockFunds()`: Dispatches `notifySafeLockFunded` to the artisan once budget is locked.
+   - `EscrowService.releaseTranche1()`: Dispatches `notifyTranche1Released` to the artisan.
+   - `EscrowService.initiateHandshake()`: Dispatches `notifyHandshakeReady` with the 4-digit Handshake Completion PIN to the client.
+   - `EscrowService.verifyHandshake()`: Dispatches `notifyPayoutSettled` to the artisan upon final settlement.
+   - `DisputesService.create()` and `resolve()`: Dispatches `notifyDisputeUpdate` to both opposing parties.
+4. **Zero Hardcoding**:
+   - Configured via environment variables (`RESEND_API_KEY`, `RESEND_FROM`, `SMTP_HOST`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM`, `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `SMS_PROVIDER`, `TERMII_API_KEY`).
+   - Added clean placeholders in `.env.example`.
+5. **Live Verification**:
+   - `tsc --noEmit` passed with 0 errors.
+   - `nest build` passed clean with code 0.
+   - Server booted live on port 3000.
+   - `GET /notifications/vapid-public-key`: Verified returning public VAPID key.
+   - `POST /notifications/test-dispatch`: Successfully delivered a real transactional email to `ikechukwualaeto@gmail.com` via Resend (ID: `01a1a2ca-0c5d-79aa-851a-67fa087469ef`).
+   - Level 1 SMS simulator verified: High-visibility console dispatch box output with formatted Nigerian phone number (`+2348031234567`).
+   - In-app notification feed verified: `unreadCount` tracking, pagination, `PATCH /notifications/read-all` marking all read.
+   - Web Push subscription & unsubscribe lifecycle tested and verified.
+
+---
+
 ### 🗓️ 2026-11-03 — Session 7: Three-Ring Shield — Full End-to-End Verification & Push
 - **Author**: Lead Engineer (AI Model: Gemini / Antigravity) & Ikechukwu Alaeto (Founder)
 - **Tag**: `[AUDIT]` `[SHIPPED]` — Closed out the Three-Ring Shield work started in Sessions 5–6.

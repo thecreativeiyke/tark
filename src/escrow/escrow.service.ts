@@ -22,6 +22,7 @@ import { JobsService } from '../jobs/jobs.service';
 import { Job, JobStatus } from '../jobs/entities/job.entity';
 import { User } from '../users/entities/user.entity';
 import { PaymentsService } from '../payments/payments.service';
+import { NotificationsService } from '../notifications/notifications.service';
 
 // Maximum failed PIN attempts before the handshake is reset
 const MAX_PIN_ATTEMPTS = 5;
@@ -44,6 +45,8 @@ export class EscrowService {
     private jobsService: JobsService,
     @Inject(forwardRef(() => PaymentsService))
     private paymentsService: PaymentsService,
+    @Inject(forwardRef(() => NotificationsService))
+    private notificationsService: NotificationsService,
   ) {}
 
   // ─────────────────────────────────────────────────────────────────────
@@ -299,7 +302,7 @@ export class EscrowService {
   // never a public route.
   // ─────────────────────────────────────────────────────────────────────
   async lockFunds(id: string) {
-    return this.dataSource.transaction(async (manager) => {
+    const saved = await this.dataSource.transaction(async (manager) => {
       const escrow = await this.lockEscrow(manager, id);
 
       if (escrow.totalStatus !== EscrowStatus.INITIATED) {
@@ -313,6 +316,32 @@ export class EscrowService {
       await manager.update(Job, escrow.jobId, { status: JobStatus.IN_PROGRESS });
       return manager.save(EscrowTransaction, escrow);
     });
+
+    // Notify artisan that escrow is funded and ready
+    this.dataSource
+      .getRepository(Job)
+      .findOne({ where: { id: saved.jobId } })
+      .then(async (job) => {
+        if (!job || !saved.artisanId) return;
+        const [client, artisan] = await Promise.all([
+          this.dataSource.getRepository(User).findOne({ where: { id: saved.clientId } }),
+          this.dataSource.getRepository(User).findOne({ where: { id: saved.artisanId } }),
+        ]);
+        const totalEscrowBudget = Number(saved.tranche1Amount) + Number(saved.tranche2Amount);
+        return this.notificationsService.notifySafeLockFunded({
+          artisanId: saved.artisanId,
+          artisanName: artisan?.fullName || 'Artisan',
+          clientName: client?.fullName || 'Client',
+          jobTitle: job.title,
+          totalBudget: totalEscrowBudget,
+          tranche1Amount: Number(saved.tranche1Amount),
+          jobId: job.id,
+          escrowId: saved.id,
+        });
+      })
+      .catch((err) => this.logger.error(`Failed to dispatch Safe-Lock funded alert: ${err.message}`));
+
+    return saved;
   }
 
   // ─────────────────────────────────────────────────────────────────────
@@ -320,7 +349,7 @@ export class EscrowService {
   // account. Only allowed while funds are locked (not disputed / mid-handshake).
   // ─────────────────────────────────────────────────────────────────────
   async releaseTranche1(id: string, clientId: string) {
-    return this.dataSource.transaction(async (manager) => {
+    const saved = await this.dataSource.transaction(async (manager) => {
       const escrow = await this.lockEscrow(manager, id);
 
       if (escrow.clientId !== clientId) {
@@ -353,6 +382,25 @@ export class EscrowService {
 
       return manager.save(EscrowTransaction, escrow);
     });
+
+    // Notify artisan of mobilization disbursement
+    this.dataSource
+      .getRepository(Job)
+      .findOne({ where: { id: saved.jobId } })
+      .then(async (job) => {
+        if (!job || !saved.artisanId) return;
+        const artisan = await this.dataSource.getRepository(User).findOne({ where: { id: saved.artisanId } });
+        return this.notificationsService.notifyTranche1Released({
+          artisanId: saved.artisanId,
+          artisanName: artisan?.fullName || 'Artisan',
+          jobTitle: job.title,
+          amount: Number(saved.tranche1Amount),
+          jobId: job.id,
+        });
+      })
+      .catch((err) => this.logger.error(`Failed to dispatch Tranche 1 alert: ${err.message}`));
+
+    return saved;
   }
 
   // ─────────────────────────────────────────────────────────────────────
@@ -362,6 +410,7 @@ export class EscrowService {
   // ─────────────────────────────────────────────────────────────────────
   async initiateHandshake(id: string, artisanId: string, proofOfWorkUrls?: string[]) {
     const expiresAt = new Date(Date.now() + PIN_TTL_MS);
+    let capturedEscrow: EscrowTransaction | null = null;
 
     await this.dataSource.transaction(async (manager) => {
       const escrow = await this.lockEscrow(manager, id);
@@ -392,8 +441,32 @@ export class EscrowService {
       escrow.totalStatus = EscrowStatus.HANDSHAKE_PENDING;
       escrow.proofOfWorkUrls = proofOfWorkUrls;
 
-      await manager.save(EscrowTransaction, escrow);
+      capturedEscrow = await manager.save(EscrowTransaction, escrow);
     });
+
+    // Dispatch Handshake PIN alert to Client (via Email, In-App, Push & SMS)
+    if (capturedEscrow) {
+      const savedEscrow: EscrowTransaction = capturedEscrow;
+      this.dataSource
+        .getRepository(Job)
+        .findOne({ where: { id: savedEscrow.jobId } })
+        .then(async (job) => {
+          if (!job) return;
+          const [client, artisan] = await Promise.all([
+            this.dataSource.getRepository(User).findOne({ where: { id: savedEscrow.clientId } }),
+            this.dataSource.getRepository(User).findOne({ where: { id: savedEscrow.artisanId } }),
+          ]);
+          return this.notificationsService.notifyHandshakeReady({
+            clientId: savedEscrow.clientId,
+            clientName: client?.fullName || 'Client',
+            artisanName: artisan?.fullName || 'Artisan',
+            jobTitle: job.title,
+            handshakePin: savedEscrow.handshakePin!,
+            jobId: job.id,
+          });
+        })
+        .catch((err) => this.logger.error(`Failed to dispatch Handshake alert: ${err.message}`));
+    }
 
     // Never log the PIN itself.
     this.logger.log(
@@ -463,6 +536,34 @@ export class EscrowService {
     if ('rejectedMessage' in outcome) {
       throw new BadRequestException(outcome.rejectedMessage);
     }
+
+    // Payout settled successfully: Notify artisan of final settlement & payout
+    const settledEscrow = outcome.escrow;
+    this.dataSource
+      .getRepository(Job)
+      .findOne({ where: { id: settledEscrow.jobId } })
+      .then(async (job) => {
+        if (!job || !settledEscrow.artisanId) return;
+        const artisan = await this.dataSource
+          .getRepository(User)
+          .findOne({ where: { id: settledEscrow.artisanId } });
+        const grossFinal = Number(settledEscrow.tranche2Amount);
+        const fee = Number(settledEscrow.platformFeeAmount || 0);
+        const netDisbursed = Math.max(0, grossFinal - fee);
+        const totalJobBudget = Number(settledEscrow.tranche1Amount) + Number(settledEscrow.tranche2Amount);
+        return this.notificationsService.notifyPayoutSettled({
+          artisanId: settledEscrow.artisanId,
+          artisanName: artisan?.fullName || 'Artisan',
+          jobTitle: job.title,
+          disbursedAmount: netDisbursed,
+          platformFeeAmount: fee,
+          totalJobBudget: totalJobBudget,
+          accountMasked: artisan?.phoneNumber ? `***${artisan.phoneNumber.slice(-4)}` : undefined,
+          jobId: job.id,
+        });
+      })
+      .catch((err) => this.logger.error(`Failed to dispatch payout alert: ${err.message}`));
+
     return outcome.escrow;
   }
 

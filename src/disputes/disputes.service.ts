@@ -25,6 +25,7 @@ import {
 import { Job, JobStatus } from '../jobs/entities/job.entity';
 import { User, UserRole } from '../users/entities/user.entity';
 import { PaymentsService } from '../payments/payments.service';
+import { NotificationsService } from '../notifications/notifications.service';
 
 @Injectable()
 export class DisputesService {
@@ -42,6 +43,7 @@ export class DisputesService {
     @InjectDataSource()
     private dataSource: DataSource,
     private paymentsService: PaymentsService,
+    private notificationsService: NotificationsService,
   ) {}
 
   // ─────────────────────────────────────────────────────────────────────
@@ -128,6 +130,24 @@ export class DisputesService {
 
       const savedDispute = await manager.save(Dispute, dispute);
       this.logger.warn(`Dispute opened: #${savedDispute.id} by ${initiatorId} on Escrow #${lockedEscrow.id}`);
+
+      // Dispatch notice to defendant
+      Promise.all([
+        this.usersRepository.findOne({ where: { id: defendantId } }),
+        this.jobsRepository.findOne({ where: { id: lockedEscrow.jobId } }),
+      ])
+        .then(([defendant, job]) => {
+          if (!defendant) return;
+          return this.notificationsService.notifyDisputeUpdate({
+            userId: defendant.id,
+            userName: defendant.fullName,
+            jobTitle: job?.title || 'Service Job',
+            disputeReason: dto.claimStatement,
+            status: 'OPEN - 48h Response Window Active',
+            disputeId: savedDispute.id,
+          });
+        })
+        .catch((err) => this.logger.error(`Dispute notice error: ${err.message}`));
 
       return {
         message: 'Dispute opened successfully. The opposing party has 48 hours to submit their counter-evidence.',
@@ -279,6 +299,7 @@ export class DisputesService {
     const artisan = escrow.artisanId
       ? await this.usersRepository.findOneBy({ id: escrow.artisanId })
       : null;
+    const job = await this.jobsRepository.findOneBy({ id: dispute.jobId });
 
     if (!client) {
       throw new NotFoundException('Client associated with escrow not found');
@@ -411,6 +432,41 @@ export class DisputesService {
       dispute.status = DisputeStatus.RESOLVED;
       dispute.assignedAdminId = adminId;
       await manager.save(Dispute, dispute);
+
+      // Notify both parties of official verdict
+      Promise.all([
+        this.usersRepository.findOne({ where: { id: client.id } }),
+        artisan ? this.usersRepository.findOne({ where: { id: artisan.id } }) : null,
+      ])
+        .then(([cUser, aUser]) => {
+          if (cUser) {
+            this.notificationsService
+              .notifyDisputeUpdate({
+                userId: cUser.id,
+                userName: cUser.fullName,
+                jobTitle: job?.title || 'Service Job',
+                disputeReason: dispute.claimStatement,
+                status: `RESOLVED: ${dto.verdict}`,
+                resolutionNotes: dto.resolutionNotes,
+                disputeId: dispute.id,
+              })
+              .catch(() => {});
+          }
+          if (aUser) {
+            this.notificationsService
+              .notifyDisputeUpdate({
+                userId: aUser.id,
+                userName: aUser.fullName,
+                jobTitle: job?.title || 'Service Job',
+                disputeReason: dispute.claimStatement,
+                status: `RESOLVED: ${dto.verdict}`,
+                resolutionNotes: dto.resolutionNotes,
+                disputeId: dispute.id,
+              })
+              .catch(() => {});
+          }
+        })
+        .catch((err) => this.logger.error(`Dispute verdict notice error: ${err.message}`));
 
       return {
         message: `Dispute resolved successfully with verdict: ${dto.verdict}`,

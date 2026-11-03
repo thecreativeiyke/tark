@@ -11,6 +11,8 @@ import { CreateBidDto } from './dto/create-bid.dto';
 import { JobsService } from '../jobs/jobs.service';
 import { JobStatus } from '../jobs/entities/job.entity';
 import { EscrowService } from '../escrow/escrow.service';
+import { NotificationsService } from '../notifications/notifications.service';
+import { User } from '../users/entities/user.entity';
 
 @Injectable()
 export class BidsService {
@@ -21,6 +23,7 @@ export class BidsService {
     private dataSource: DataSource,
     private jobsService: JobsService,
     private escrowService: EscrowService,
+    private notificationsService: NotificationsService,
   ) {}
 
   async create(dto: CreateBidDto, artisanId: string, role: string) {
@@ -63,7 +66,25 @@ export class BidsService {
       artisanId,
       status: BidStatus.PENDING,
     });
-    return this.bidsRepository.save(bid);
+    const savedBid = await this.bidsRepository.save(bid);
+
+    // Multi-Channel Dispatch to Client (async, non-blocking)
+    this.dataSource
+      .getRepository(User)
+      .findOne({ where: { id: artisanId } })
+      .then((artisan) => {
+        return this.notificationsService.notifyBidReceived({
+          clientId: job.clientId,
+          clientName: 'Tark Client',
+          artisanName: artisan?.fullName || 'Artisan',
+          jobTitle: job.title,
+          bidAmount: Number(dto.amount),
+          jobId: job.id,
+        });
+      })
+      .catch((err) => console.error('Failed to dispatch bid notification:', err));
+
+    return savedBid;
   }
 
   async findByJob(jobId: string) {
