@@ -154,9 +154,11 @@ export class EscrowService {
       escrow.tranche1Status !== TrancheStatus.RELEASED
         ? this.toMinor(escrow.tranche1Amount)
         : 0;
-    const amountMinor = t1UnpaidMinor + this.toMinor(escrow.tranche2Amount);
+    const feeMinor = this.toMinor(escrow.platformFeeAmount || 0);
+    const grossFinalMinor = t1UnpaidMinor + this.toMinor(escrow.tranche2Amount);
+    const amountMinor = Math.max(0, grossFinalMinor - feeMinor);
     if (amountMinor <= 0) {
-      throw new BadRequestException('There is nothing left to pay out on this escrow');
+      throw new BadRequestException('There is nothing left to pay out on this escrow after platform fee');
     }
 
     const transfer = await this.paymentsService.initiateTransfer(
@@ -215,6 +217,10 @@ export class EscrowService {
       throw new BadRequestException('An escrow already exists for this job');
     }
 
+    const totalBudget = Number(job.tranche1Amount) + Number(job.tranche2Amount);
+    // 5% Tark Protocol Fee (calculated on total job budget, retained by platform upon settlement)
+    const platformFee = Math.round(totalBudget * 0.05 * 100) / 100;
+
     const escrow = this.escrowRepository.create({
       jobId: job.id,
       clientId,
@@ -222,6 +228,7 @@ export class EscrowService {
       currency: job.currency || 'NGN',
       tranche1Amount: Number(job.tranche1Amount),
       tranche2Amount: Number(job.tranche2Amount),
+      platformFeeAmount: platformFee,
       totalStatus: EscrowStatus.INITIATED,
       tranche1Status: TrancheStatus.PENDING,
       tranche2Status: TrancheStatus.PENDING,

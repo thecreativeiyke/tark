@@ -84,39 +84,57 @@ export class DisputesService {
       throw new BadRequestException('Cannot determine opposing party on this escrow');
     }
 
-    // Freeze escrow state
-    escrow.totalStatus = EscrowStatus.DISPUTED;
-    escrow.handshakePin = null;
-    escrow.handshakeExpiresAt = null;
-    await this.escrowRepository.save(escrow);
+    return this.dataSource.transaction(async (manager) => {
+      // Pessimistic lock on escrow to prevent race conditions with handshake verification
+      const lockedEscrow = await manager
+        .getRepository(EscrowTransaction)
+        .createQueryBuilder('escrow')
+        .setLock('pessimistic_write')
+        .where('escrow.id = :id', { id: escrow.id })
+        .getOne();
 
-    // Freeze job state
-    await this.jobsRepository.update(escrow.jobId, { status: JobStatus.DISPUTED });
+      if (!lockedEscrow) {
+        throw new NotFoundException('Associated escrow not found');
+      }
 
-    // 48-hour response deadline for the opposing party
-    const responseDeadline = new Date(Date.now() + 48 * 60 * 60 * 1000);
+      if (lockedEscrow.totalStatus === EscrowStatus.SETTLED) {
+        throw new BadRequestException('Cannot raise a dispute on a completed and settled escrow');
+      }
 
-    const dispute = this.disputesRepository.create({
-      jobId: escrow.jobId,
-      escrowId: escrow.id,
-      initiatorId,
-      defendantId,
-      category: dto.category,
-      claimStatement: dto.claimStatement,
-      evidenceUrls: dto.evidenceUrls || [],
-      responseDeadline,
-      status: DisputeStatus.OPEN,
-      adminDepartment: 'DISPUTE_DESK',
+      // Freeze escrow state
+      lockedEscrow.totalStatus = EscrowStatus.DISPUTED;
+      lockedEscrow.handshakePin = null;
+      lockedEscrow.handshakeExpiresAt = null;
+      await manager.save(EscrowTransaction, lockedEscrow);
+
+      // Freeze job state
+      await manager.update(Job, lockedEscrow.jobId, { status: JobStatus.DISPUTED });
+
+      // 48-hour response deadline for the opposing party
+      const responseDeadline = new Date(Date.now() + 48 * 60 * 60 * 1000);
+
+      const dispute = manager.create(Dispute, {
+        jobId: lockedEscrow.jobId,
+        escrowId: lockedEscrow.id,
+        initiatorId,
+        defendantId,
+        category: dto.category,
+        claimStatement: dto.claimStatement,
+        evidenceUrls: dto.evidenceUrls || [],
+        responseDeadline,
+        status: DisputeStatus.OPEN,
+        adminDepartment: 'DISPUTE_DESK',
+      });
+
+      const savedDispute = await manager.save(Dispute, dispute);
+      this.logger.warn(`Dispute opened: #${savedDispute.id} by ${initiatorId} on Escrow #${lockedEscrow.id}`);
+
+      return {
+        message: 'Dispute opened successfully. The opposing party has 48 hours to submit their counter-evidence.',
+        dispute: savedDispute,
+        responseDeadline,
+      };
     });
-
-    const savedDispute = await this.disputesRepository.save(dispute);
-    this.logger.warn(`Dispute opened: #${savedDispute.id} by ${initiatorId} on Escrow #${escrow.id}`);
-
-    return {
-      message: 'Dispute opened successfully. The opposing party has 48 hours to submit their counter-evidence.',
-      dispute: savedDispute,
-      responseDeadline,
-    };
   }
 
   // ─────────────────────────────────────────────────────────────────────
@@ -251,6 +269,12 @@ export class DisputesService {
       throw new NotFoundException('Associated escrow not found');
     }
 
+    if (escrow.totalStatus !== EscrowStatus.DISPUTED) {
+      throw new BadRequestException(
+        `Cannot resolve a dispute on an escrow that is not in DISPUTED status (Current status: ${escrow.totalStatus})`,
+      );
+    }
+
     const client = await this.usersRepository.findOneBy({ id: escrow.clientId });
     const artisan = escrow.artisanId
       ? await this.usersRepository.findOneBy({ id: escrow.artisanId })
@@ -309,10 +333,33 @@ export class DisputesService {
 
     // Execute financial execution and database mutations in an atomic transaction
     return this.dataSource.transaction(async (manager) => {
-      // 1. Credit Client In-App Wallet if refund is due
+      // Lock escrow row to prevent double-settlement
+      const lockedEscrow = await manager
+        .getRepository(EscrowTransaction)
+        .createQueryBuilder('escrow')
+        .setLock('pessimistic_write')
+        .where('escrow.id = :id', { id: escrow.id })
+        .getOne();
+
+      if (!lockedEscrow || lockedEscrow.totalStatus !== EscrowStatus.DISPUTED) {
+        throw new BadRequestException('Escrow is no longer in DISPUTED status');
+      }
+
+      // 1. Credit Client In-App Wallet with pessimistic row lock
       if (clientRefund > 0) {
-        client.walletBalance = Number(client.walletBalance || 0) + clientRefund;
-        await manager.save(User, client);
+        const lockedClient = await manager
+          .getRepository(User)
+          .createQueryBuilder('user')
+          .setLock('pessimistic_write')
+          .where('user.id = :id', { id: client.id })
+          .getOne();
+
+        if (!lockedClient) {
+          throw new NotFoundException('Client record not found during wallet settlement');
+        }
+
+        lockedClient.walletBalance = Number(lockedClient.walletBalance || 0) + clientRefund;
+        await manager.save(User, lockedClient);
         this.logger.log(`Dispute Refund: ₦${clientRefund} credited to Client (${client.id}) wallet`);
       }
 
@@ -326,24 +373,27 @@ export class DisputesService {
         }
 
         const amountKobo = Math.round(artisanPayout * 100);
+        const disputePayoutRef = `tark-dispute-${dispute.id}`;
+
         await this.paymentsService.initiateTransfer(
           amountKobo,
           artisan.payoutRecipientCode,
           `Tark Dispute Settlement: Job #${escrow.jobId.slice(0, 8)}`,
           escrow.currency,
+          disputePayoutRef,
         );
       }
 
       // 3. Update Escrow status
-      escrow.totalStatus = EscrowStatus.SETTLED;
+      lockedEscrow.totalStatus = EscrowStatus.SETTLED;
       if (clientRefund > 0 && artisanPayout === 0) {
-        escrow.tranche1Status = TrancheStatus.REFUNDED;
-        escrow.tranche2Status = TrancheStatus.REFUNDED;
+        lockedEscrow.tranche1Status = TrancheStatus.REFUNDED;
+        lockedEscrow.tranche2Status = TrancheStatus.REFUNDED;
       } else {
-        escrow.tranche1Status = TrancheStatus.RELEASED;
-        escrow.tranche2Status = TrancheStatus.RELEASED;
+        lockedEscrow.tranche1Status = TrancheStatus.RELEASED;
+        lockedEscrow.tranche2Status = TrancheStatus.RELEASED;
       }
-      await manager.save(EscrowTransaction, escrow);
+      await manager.save(EscrowTransaction, lockedEscrow);
 
       // 4. Update Job status
       const finalJobStatus =

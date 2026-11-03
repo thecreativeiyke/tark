@@ -2,6 +2,7 @@ import {
   Injectable,
   NotFoundException,
   ForbiddenException,
+  BadRequestException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
@@ -9,17 +10,27 @@ import { Job, JobStatus } from './entities/job.entity';
 import { CreateJobDto } from './dto/create-job.dto';
 import { UpdateJobDto } from './dto/update-job.dto';
 import { QueryJobDto } from './dto/query-job.dto';
+import { CategoriesService } from '../categories/categories.service';
 
 @Injectable()
 export class JobsService {
   constructor(
     @InjectRepository(Job)
     private jobsRepository: Repository<Job>,
+    private categoriesService: CategoriesService,
   ) {}
 
   async create(createJobDto: CreateJobDto, clientId: string) {
+    const category = await this.categoriesService.resolveCategory(createJobDto.category);
+    if (!category) {
+      throw new BadRequestException(
+        `Invalid category "${createJobDto.category}". Please select a recognized artisan trade.`,
+      );
+    }
+
     const job = this.jobsRepository.create({
       ...createJobDto,
+      category: category.slug, // Normalized canonical slug
       clientId,
       status: JobStatus.OPEN,
     });
@@ -79,6 +90,11 @@ export class JobsService {
     if (job.clientId !== userId) {
       throw new ForbiddenException('You can only update your own jobs');
     }
+    if (job.status !== JobStatus.OPEN) {
+      throw new BadRequestException(
+        `Cannot modify a job once a bid has been accepted or work is underway (Current status: ${job.status})`,
+      );
+    }
     Object.assign(job, updateJobDto);
     return this.jobsRepository.save(job);
   }
@@ -94,6 +110,11 @@ export class JobsService {
     const job = await this.findOne(id);
     if (job.clientId !== userId) {
       throw new ForbiddenException('You can only delete your own jobs');
+    }
+    if (job.status !== JobStatus.OPEN) {
+      throw new BadRequestException(
+        `Cannot delete a job with active contracts or locked Safe-Lock funds (Current status: ${job.status})`,
+      );
     }
     return this.jobsRepository.softDelete(id);
   }

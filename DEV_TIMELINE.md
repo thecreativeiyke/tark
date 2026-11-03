@@ -25,6 +25,37 @@
 
 ## 🗓️ Session Log
 
+### 🗓️ 2026-11-03 — Session 5: Peer-Review Hardening Pass (Claude Audit & Gemini Execution)
+- **Author**: Lead Engineers: Claude (Principal Code Audit) & Gemini (Fixes Implementation & Verification)
+- **Tag**: `[FLAGGED & FIXED]` & `[AUDIT]`
+
+#### ⚠️ Issues Flagged by Claude's Codebase Audit:
+1. **Job Mutation/Deletion Vulnerability**: `JobsService.remove` and `update` allowed clients to delete or alter jobs even while `IN_PROGRESS` with locked Safe-Lock funds.
+2. **Dispute Settlement Concurrency Risk**: `DisputesService.resolve` did not verify `DISPUTED` status, read client wallet outside transaction without pessimistic lock, and omitted deterministic Paystack transfer references.
+3. **Missing 5% Platform Fee Deduction**: ADR 002 declared a 5% platform fee, but arithmetic was never calculated or deducted from final payouts.
+4. **Loose Category String Matching**: Free text strings in `Job.category` caused mismatch with category slugs.
+
+#### 🔧 Corrections Applied:
+1. **Job Lock**: Enforced that `update()` and `remove()` strictly throw `BadRequestException` if `job.status !== JobStatus.OPEN`.
+2. **Dispute Hardening**:
+   - Enforced `escrow.totalStatus === EscrowStatus.DISPUTED` check before resolution.
+   - Wrapped operations in `pessimistic_write` row locks on both `EscrowTransaction` and `User` (client wallet).
+   - Added deterministic Paystack payout idempotency reference: `tark-dispute-${dispute.id}`.
+   - Added row lock on escrow in `DisputesService.create()` to prevent race condition with handshake PIN verification.
+3. **Platform Fee Wire-Up**:
+   - `EscrowService.create()` now automatically computes `platformFeeAmount = Math.round(totalBudget * 0.05 * 100) / 100`.
+   - `EscrowService.payoutAndSettle()` deducts `platformFeeAmount` from the final artisan disbursement, retaining platform revenue securely.
+4. **Category Slug Canonicalization**:
+   - Injected `CategoriesService` into `JobsService`.
+   - `JobsService.create()` now validates and resolves categories by slug or name, normalizing `job.category` to the canonical slug (rejecting unknown categories).
+
+#### 🧪 Verification:
+- TypeScript compilation passed with zero errors (`tsc --noEmit`).
+- NestJS build passed cleanly.
+- Server rebooted and verified active on port 3000.
+
+---
+
 ### 🗓️ 2026-11-03 — Session 4: Developer Manifestos, ADR System & Fullstack Vision
 - **Author**: Lead Engineer (AI Model: Gemini 3.8 Flash) & Ikechukwu Alaeto (Founder)
 - **Tag**: `[SHIPPED]` & `[DECISION]`

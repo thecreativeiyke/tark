@@ -43,4 +43,22 @@ export class CategoriesService implements OnModuleInit {
   findBySlug(slug: string) {
     return this.categoryRepository.findOneBy({ slug, isActive: true });
   }
+
+  async resolveCategory(input: string): Promise<Category | null> {
+    if (!input) return null;
+    const trimmed = input.trim();
+    // 1. Try exact slug match
+    const bySlug = await this.categoryRepository.findOneBy({
+      slug: trimmed.toLowerCase(),
+      isActive: true,
+    });
+    if (bySlug) return bySlug;
+
+    // 2. Try case-insensitive name match
+    return this.categoryRepository
+      .createQueryBuilder('category')
+      .where('LOWER(category.name) = LOWER(:name)', { name: trimmed })
+      .andWhere('category.isActive = true')
+      .getOne();
+  }
 }
