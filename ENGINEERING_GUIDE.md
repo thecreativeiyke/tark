@@ -46,7 +46,40 @@ While the backend protocol is rigorous and mathematically sound, the user-facing
 
 ---
 
-## 🏗️ 2. High-Level Architecture & Tech Stack
+## 📱 2. The Fullstack Ecosystem: API-First Architecture
+
+Tark is an end-to-end **fullstack ecosystem**. We are building the backend first with obsessive rigor so that when we build the mobile and web frontend applications, they sit atop an indestructible, rock-solid foundation.
+
+### The 3 Frontend Clients We Are Building For:
+1. **Tark Client Mobile App** (Mobile-first):
+   - Fast geo-location discovery of artisans nearby.
+   - 1-click job posting with diagnostic media uploads.
+   - Real-time bid comparison & in-app chat.
+   - **Tark Safe-Lock** funding & viewing the 6-digit Job Completion Code.
+   - In-app wallet management (instant refunds & re-use).
+
+2. **Tark Artisan Mobile App** (Mobile-first):
+   - Real-time job alerts (Push + SMS) matching their trade and location.
+   - One-tap bid submission and negotiation.
+   - Safe-Lock tracking: instant notification of *Start-Work Mobilization* release.
+   - In-app camera integration with Cloudflare R2 (`iyke-storage`) for mandatory proof-of-work uploads.
+   - In-person Job Completion Code input to trigger instant bank transfer via Paystack.
+
+3. **Tark Operations & Admin Web Console** (Desktop Web):
+   - Review moderation queue (approving/rejecting client ratings).
+   - Dispute arbitration desk with evidence inspection and multi-path verdicts.
+   - AI triage escalation dashboard with Gemini-generated succinct briefs and frustration scores.
+   - Artisan KYC verification desk (NIN/BVN approval for the "Certified by Tark" badge).
+
+### Non-Negotiable API Standards for Frontend Readiness:
+- **Predictable Response Shapes**: Never return arbitrary or changing JSON keys. Every response must match a defined DTO or entity structure.
+- **Actionable Error Messages**: Frontend apps need clear errors to show users. Always provide descriptive messages in exceptions (e.g. `BadRequestException('At least 1 proof-of-work photo is required')` instead of generic errors).
+- **Mobile Bandwidth Conscious**: Many users and artisans in Nigeria are on metered mobile data (2G/3G/4G). Keep API payloads lean, paginate list endpoints, and let Cloudflare R2 CDN handle media delivery.
+- **CORS & Auth Headers**: CORS is enabled globally for all mobile and web origins. All protected routes strictly enforce Bearer JWT tokens.
+
+---
+
+## 🏗️ 3. High-Level Architecture & Tech Stack
 
 ```
                           ┌────────────────────────────────┐
@@ -85,7 +118,7 @@ While the backend protocol is rigorous and mathematically sound, the user-facing
 
 ---
 
-## 🔒 3. The 10 Commandments of Tark Engineering
+## 🔒 4. The 10 Commandments of Tark Engineering
 
 ### 1. Atomic Database Transactions on All Fund Operations
 Whenever accepting a bid, funding an escrow, releasing a tranche, or refunding a client, wrap the entire operation in a `DataSource.transaction()` block:
@@ -152,7 +185,7 @@ No production API key, Supabase password, Paystack secret, or Gemini token may e
 
 ---
 
-## 📁 4. Project Directory Structure
+## 📁 5. Project Directory Structure
 
 ```
 src/
@@ -172,7 +205,7 @@ src/
 
 ---
 
-## 🚀 5. Local Setup & Contribution Workflow
+## 🚀 6. Local Setup & Contribution Workflow
 
 ### 1. Prerequisites
 - **Node.js**: v18.x or v20.x
@@ -212,7 +245,7 @@ We follow conventional commit guidelines:
 
 ---
 
-## 🤝 6. Final Word
+## 🤝 7. Final Word
 
 Every piece of logic you build in Tark will touch the real world. A prompt response on an artisan's phone means dinner on the table. A secured Safe-Lock escrow means a family's generator or roof gets fixed without anxiety.
 
