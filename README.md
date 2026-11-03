@@ -87,7 +87,8 @@ Server will be running at `http://localhost:3000`.
 
 ---
 
-## 👥 Contributors & Maintainers
+## 👥 Contributors & Engineering Team
 
-- **Founder & Lead**: Ikechukwu Alaeto ([@thecreativeiyke](https://github.com/thecreativeiyke))
+- **Founder & Product Lead**: Ikechukwu Alaeto ([@thecreativeiyke](https://github.com/thecreativeiyke))
+- **Lead Engineers**: **Claude** & **Gemini** (AI Engineering Core)
 - **License**: Private & Proprietary — Tark Platform

@@ -19,6 +19,7 @@
 - **Payments**: Paystack gateway with NUBAN bank resolution, dedicated accounts, and transfer idempotency.
 - **AI Intelligence**: Google Gemini 3.5 Flash (primary triage) + Gemini 2.5 Flash (fallback).
 - **GitHub Repository**: [`https://github.com/thecreativeiyke/tark.git`](https://github.com/thecreativeiyke/tark.git) (`main` branch).
+- **Core Engineering Team**: Ikechukwu Alaeto (Founder & Product Lead), **Claude** & **Gemini** (Lead Engineers - AI Core).
 
 ---
 

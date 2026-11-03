@@ -245,7 +245,14 @@ We follow conventional commit guidelines:
 
 ---
 
-## 🤝 7. Final Word
+## 👥 7. Core Engineering Roster
+
+- **Founder & Product Lead**: Ikechukwu Alaeto ([@thecreativeiyke](https://github.com/thecreativeiyke))
+- **Lead Engineers**: **Claude** & **Gemini** (AI Engineering Core)
+
+---
+
+## 🤝 8. Final Word
 
 Every piece of logic you build in Tark will touch the real world. A prompt response on an artisan's phone means dinner on the table. A secured Safe-Lock escrow means a family's generator or roof gets fixed without anxiety.
 
