@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Tark - Web Push Test</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+           background:#0B0F19; color:#E2E8F0; margin:0; padding:24px; }
+    main { max-width: 640px; margin: 0 auto; }
+    h1 { font-size: 20px; margin: 0 0 4px; }
+    p.sub { color:#94A3B8; margin: 0 0 20px; font-size: 14px; }
+    section { background:#161B26; border:1px solid #232B3B; border-radius:12px; padding:16px; margin-bottom:14px; }
+    h2 { font-size: 14px; margin: 0 0 10px; color:#10B981; text-transform: uppercase; letter-spacing: .5px; }
+    label { display:block; font-size:12px; color:#94A3B8; margin:8px 0 4px; }
+    input { width:100%; box-sizing:border-box; padding:9px 10px; border-radius:8px; border:1px solid #2A3345;
+            background:#0F1420; color:#E2E8F0; font-size:14px; }
+    button { margin-top:10px; margin-right:8px; padding:9px 14px; border-radius:8px; border:0; cursor:pointer;
+             background:#10B981; color:#04130D; font-weight:700; font-size:13px; }
+    button.secondary { background:#232B3B; color:#E2E8F0; }
+    button:disabled { opacity:.45; cursor:not-allowed; }
+    pre { background:#0F1420; border:1px solid #232B3B; border-radius:8px; padding:12px; font-size:12px;
+          white-space:pre-wrap; word-break:break-word; max-height:260px; overflow:auto; margin:0; }
+    .diag { font-size:13px; color:#CBD5E1; line-height:1.7; }
+    .ok { color:#10B981; } .bad { color:#F87171; }
+    small { color:#94A3B8; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Tark Web Push Test</h1>
+  <p class="sub">Development harness. Log in as a real Tark user, subscribe this browser, then send yourself a push.</p>
+
+  <section>
+    <h2>Browser check</h2>
+    <div class="diag" id="diag"></div>
+  </section>
+
+  <section>
+    <h2>1. Log in</h2>
+    <label>API base URL</label>
+    <input id="api" value="http://localhost:3000" />
+    <label>Email</label>
+    <input id="email" type="email" autocomplete="username" />
+    <label>Password</label>
+    <input id="password" type="password" autocomplete="current-password" />
+    <button id="btnLogin">Log in</button>
+    <small id="loginState"> Not logged in. The token is kept in memory only.</small>
+  </section>
+
+  <section>
+    <h2>2. Enable push on this browser</h2>
+    <button id="btnSubscribe" disabled>Allow notifications &amp; subscribe</button>
+    <button id="btnUnsubscribe" class="secondary" disabled>Unsubscribe</button>
+    <br />
+    <small>Clicking will show the browser's permission prompt. You must click Allow.</small>
+  </section>
+
+  <section>
+    <h2>3. Send a test</h2>
+    <button id="btnLocal" class="secondary">Local notification (no server)</button>
+    <button id="btnPush" disabled>Send push from Tark server</button>
+    <br />
+    <small>"Local" proves the browser and Windows will show notifications at all. "Send push" proves the full server → browser path.</small>
+  </section>
+
+  <section>
+    <h2>Log</h2>
+    <pre id="log"></pre>
+  </section>
+</main>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  let token = null;
+  let registration = null;
+
+  function log(msg) {
+    $('log').textContent = `[${new Date().toLocaleTimeString()}] ${msg}\n` + $('log').textContent;
+  }
+
+  function diag() {
+    const rows = [
+      ['Secure context (needed for push)', window.isSecureContext],
+      ['Service workers supported', 'serviceWorker' in navigator],
+      ['Push supported', 'PushManager' in window],
+      ['Notifications supported', 'Notification' in window],
+    ];
+    let html = rows.map(([k, v]) => `${k}: <b class="${v ? 'ok' : 'bad'}">${v ? 'yes' : 'NO'}</b>`).join('<br>');
+    const perm = 'Notification' in window ? Notification.permission : 'n/a';
+    html += `<br>Permission: <b class="${perm === 'granted' ? 'ok' : perm === 'denied' ? 'bad' : ''}">${perm}</b>`;
+    $('diag').innerHTML = html;
+  }
+
+  async function api(path, options = {}) {
+    const base = $('api').value.replace(/\/$/, '');
+    const headers = { 'Content-Type': 'application/json', ...(options.headers || {}) };
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const res = await fetch(base + path, { ...options, headers });
+    let body = null;
+    try { body = await res.json(); } catch (e) { /* empty body */ }
+    if (!res.ok) {
+      const msg = body && body.message ? JSON.stringify(body.message) : res.statusText;
+      throw new Error(`${res.status} ${msg}`);
+    }
+    return body;
+  }
+
+  function urlBase64ToUint8Array(base64) {
+    const padding = '='.repeat((4 - (base64.length % 4)) % 4);
+    const b64 = (base64 + padding).replace(/-/g, '+').replace(/_/g, '/');
+    const raw = atob(b64);
+    return Uint8Array.from([...raw].map((c) => c.charCodeAt(0)));
+  }
+
+  async function ensureRegistration() {
+    if (!registration) {
+      registration = await navigator.serviceWorker.register('/sw.js');
+      await navigator.serviceWorker.ready;
+      log('Service worker registered.');
+    }
+    return registration;
+  }
+
+  $('btnLogin').onclick = async () => {
+    try {
+      const data = await api('/auth/login', {
+        method: 'POST',
+        body: JSON.stringify({ email: $('email').value.trim(), password: $('password').value }),
+      });
+      token = data.accessToken;
+      $('password').value = '';
+      $('loginState').textContent = ' Logged in.';
+      $('btnSubscribe').disabled = false;
+      $('btnUnsubscribe').disabled = false;
+      $('btnPush').disabled = false;
+      log('Login OK.');
+    } catch (e) {
+      log('Login failed: ' + e.message);
+    }
+  };
+
+  $('btnSubscribe').onclick = async () => {
+    try {
+      if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
+        return log('This browser does not support Web Push.');
+      }
+      const perm = await Notification.requestPermission();
+      diag();
+      if (perm !== 'granted') return log(`Permission is "${perm}". Allow notifications for localhost in the browser site settings, then try again.`);
+
+      const reg = await ensureRegistration();
+      const { publicKey } = await api('/notifications/vapid-public-key');
+      if (!publicKey) return log('Server returned no VAPID public key. Check VAPID_PUBLIC_KEY in .env.');
+
+      const existing = await reg.pushManager.getSubscription();
+      if (existing) await existing.unsubscribe(); // dev harness: always start clean (handles rotated VAPID keys)
+
+      const sub = await reg.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(publicKey),
+      });
+
+      // The server DTO rejects unknown fields, so send ONLY endpoint + keys (+ userAgent).
+      const json = sub.toJSON();
+      await api('/notifications/subscribe-push', {
+        method: 'POST',
+        body: JSON.stringify({
+          endpoint: json.endpoint,
+          keys: { p256dh: json.keys.p256dh, auth: json.keys.auth },
+          userAgent: navigator.userAgent.slice(0, 250),
+        }),
+      });
+      log(`Subscribed. Push service host: ${new URL(json.endpoint).host}`);
+    } catch (e) {
+      log('Subscribe failed: ' + e.message);
+    }
+  };
+
+  $('btnUnsubscribe').onclick = async () => {
+    try {
+      const reg = await ensureRegistration();
+      const sub = await reg.pushManager.getSubscription();
+      if (!sub) return log('No active subscription in this browser.');
+      const endpoint = sub.endpoint;
+      await sub.unsubscribe();
+      await api('/notifications/unsubscribe-push', { method: 'DELETE', body: JSON.stringify({ endpoint }) });
+      log('Unsubscribed (browser and server).');
+    } catch (e) {
+      log('Unsubscribe failed: ' + e.message);
+    }
+  };
+
+  $('btnLocal').onclick = async () => {
+    try {
+      if (Notification.permission !== 'granted') {
+        const perm = await Notification.requestPermission();
+        diag();
+        if (perm !== 'granted') return log(`Permission is "${perm}".`);
+      }
+      const reg = await ensureRegistration();
+      await reg.showNotification('Tark local test', {
+        body: 'If you can see this, your browser and OS will display notifications.',
+        icon: '/icon-192.png',
+        badge: '/badge-72.png',
+      });
+      log('Local notification requested. If nothing appeared, check Windows Focus Assist / Do Not Disturb and the browser site settings.');
+    } catch (e) {
+      log('Local notification failed: ' + e.message);
+    }
+  };
+
+  $('btnPush').onclick = async () => {
+    try {
+      const saved = await api('/notifications/test-dispatch', {
+        method: 'POST',
+        body: JSON.stringify({ channel: 'push', customMessage: 'Real push from the Tark server.' }),
+      });
+      log(`Server accepted the dispatch (notification ${saved.id}). Watch for the notification; the server log shows any push error.`);
+    } catch (e) {
+      log('Send failed: ' + e.message);
+    }
+  };
+
+  diag();
+  if ('serviceWorker' in navigator) ensureRegistration().catch((e) => log('Service worker registration failed: ' + e.message));
+</script>
+</body>
+</html>

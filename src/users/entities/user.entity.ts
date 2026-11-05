@@ -11,6 +11,7 @@ export enum UserRole {
   ARTISAN = 'artisan',
   ADMIN = 'admin',
   SUPER_ADMIN = 'super_admin',
+  DEVELOPER = 'developer',
 }
 
 @Entity()
@@ -26,6 +27,15 @@ export class User {
 
   @Column()
   fullName: string;
+
+  @Column({ nullable: true })
+  firstName: string;
+
+  @Column({ nullable: true })
+  middleName: string;
+
+  @Column({ nullable: true })
+  lastName: string;
 
   @Column({ nullable: true })
   phoneNumber: string;
@@ -48,6 +58,10 @@ export class User {
 
   @Column({ nullable: true })
   certificationBadgeTitle: string;
+
+  // Lifecycle status of KYC submission
+  @Column({ default: 'NOT_SUBMITTED' })
+  kycStatus: string; // 'NOT_SUBMITTED' | 'PENDING_REVIEW' | 'APPROVED' | 'REJECTED' | 'RESUBMITTED'
 
   // Reputation metrics
   @Column({ type: 'decimal', precision: 3, scale: 2, default: 0.0 })

@@ -58,7 +58,7 @@ export class PaymentsController {
     if (!escrowId) {
       throw new BadRequestException('escrowId is required');
     }
-    return this.paymentsService.initializePayment(escrowId, req.user.email);
+    return this.paymentsService.initializePayment(escrowId, req.user.email, req.user.userId);
   }
 
   @UseGuards(JwtAuthGuard)

@@ -9,6 +9,7 @@ import {
   Query,
   UseGuards,
   Request,
+  NotFoundException,
 } from '@nestjs/common';
 import { Throttle } from '@nestjs/throttler';
 import { NotificationsService } from './notifications.service';
@@ -117,7 +118,16 @@ export class NotificationsController {
     @Body('channel') channel?: 'all' | 'email' | 'sms' | 'push',
     @Body('customMessage') customMessage?: string,
   ) {
-    const text = customMessage || 'This is a live test notification from Tark Safe-Lock Multi-Channel Engine.';
+    // Dev-only helper. It must not exist in production: it would let any logged-in
+    // user trigger SMS/email sends (cost and abuse).
+    if (process.env.NODE_ENV === 'production') {
+      throw new NotFoundException();
+    }
+
+    const text = (
+      customMessage || 'This is a live test notification from Tark Safe-Lock Multi-Channel Engine.'
+    ).slice(0, 160);
+    const safeHtmlText = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     const selectedChannel = channel || 'all';
 
     const dispatchOptions: any = {
@@ -131,7 +141,7 @@ export class NotificationsController {
     if (selectedChannel === 'all' || selectedChannel === 'email') {
       dispatchOptions.email = {
         subject: '🧪 Tark Multi-Channel Test Notification',
-        html: `<p>Hello,</p><p>${text}</p><p>Multi-channel engine test successful!</p>`,
+        html: `<p>Hello,</p><p>${safeHtmlText}</p><p>Multi-channel engine test successful!</p>`,
       };
     }
 

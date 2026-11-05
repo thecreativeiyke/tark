@@ -19,6 +19,8 @@ export interface DispatchNotificationOptions {
   title: string;
   message: string;
   metadata?: Record<string, any>;
+  // Optional id of the related record (e.g. a KYC record). Stored inside `metadata` (no schema change).
+  entityId?: string;
   email?: {
     subject?: string;
     template?: EmailRenderResult;
@@ -174,7 +176,9 @@ export class NotificationsService {
       type,
       title,
       message,
-      metadata: metadata || null,
+      metadata: options.entityId
+        ? { ...(metadata || {}), entityId: options.entityId }
+        : metadata || null,
       isRead: false,
     });
     const saved = await this.notificationsRepository.save(notification);
@@ -328,11 +332,11 @@ export class NotificationsService {
       userId: params.artisanId,
       type: NotificationType.TRANCHE1_RELEASED,
       title: `Start-Work Mobilization Released`,
-      message: `₦${params.amount.toLocaleString()} has been credited to your in-app wallet for "${params.jobTitle}".`,
+      message: `₦${params.amount.toLocaleString()} has been sent to your bank account for "${params.jobTitle}".`,
       metadata: { jobId: params.jobId, amount: params.amount },
       email: { template: emailResult },
       sms: {
-        message: `Tark Alert: Start-Work Mobilization of ₦${params.amount.toLocaleString()} for "${params.jobTitle}" is in your wallet.`,
+        message: SmsTemplates.tranche1Released(params.amount, params.jobTitle),
       },
       webPush: { url: `/wallet` },
     });
@@ -349,7 +353,10 @@ export class NotificationsService {
     handshakePin: string;
     jobId: string;
   }) {
-    const smsText = SmsTemplates.handshakePin(params.handshakePin, params.jobTitle);
+    // SECURITY: the code is NOT placed in the SMS, the push body, or the stored in-app message.
+    // Those surfaces can appear on a lock screen the artisan can see. The client reads the code
+    // inside the authenticated app (GET /escrow/:id); the email is a deliberate-open channel.
+    const smsText = SmsTemplates.handshakeReady(params.jobTitle);
     const emailResult = EmailTemplates.handshakeReady({
       clientName: params.clientName,
       artisanName: params.artisanName,
@@ -362,7 +369,7 @@ export class NotificationsService {
       userId: params.clientId,
       type: NotificationType.HANDSHAKE_READY,
       title: `Job Completion Code Ready`,
-      message: `Artisan marked "${params.jobTitle}" complete. Inspect work and verify code: ${params.handshakePin}.`,
+      message: `Artisan marked "${params.jobTitle}" complete. Inspect the work, then open Tark to get your Job Completion Code.`,
       metadata: { jobId: params.jobId },
       email: { template: emailResult },
       sms: { message: smsText },

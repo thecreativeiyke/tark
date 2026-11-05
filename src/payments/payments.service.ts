@@ -1,6 +1,7 @@
 import {
   Injectable,
   BadRequestException,
+  ForbiddenException,
   InternalServerErrorException,
   NotFoundException,
   Logger,
@@ -129,8 +130,17 @@ export class PaymentsService {
     }
   }
 
-  async initializePayment(escrowId: string, email: string) {
+  async initializePayment(escrowId: string, email: string, requesterId?: string) {
     const escrow = await this.escrowService.findOne(escrowId);
+
+    // When called directly by a user, only the escrow's own client may start a payment.
+    // (generatePayForMe has already verified ownership and passes no requesterId.)
+    if (requesterId && escrow.clientId !== requesterId) {
+      throw new ForbiddenException('Only the client who created this escrow can pay for it');
+    }
+    if (escrow.totalStatus !== EscrowStatus.INITIATED) {
+      throw new BadRequestException(`Escrow is already in status: ${escrow.totalStatus}`);
+    }
     const totalAmount = Number(escrow.tranche1Amount) + Number(escrow.tranche2Amount);
     const amountMinor = Math.round(totalAmount * 100);
     const currency = escrow.currency || 'NGN';

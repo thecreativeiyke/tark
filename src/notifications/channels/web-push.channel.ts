@@ -55,11 +55,20 @@ export class WebPushChannel {
     }
 
     try {
+      // Icon/badge must be reachable by the BROWSER. A relative path like '/icon-192.png' resolves
+      // against whichever frontend registered the service worker, so set absolute https URLs
+      // (e.g. on the R2 CDN) in PUSH_ICON_URL / PUSH_BADGE_URL once brand assets are uploaded.
+      // icon: 192x192 PNG. badge: 72x72 monochrome (white on transparent) PNG.
+      const icon =
+        payload.icon || this.configService.get<string>('PUSH_ICON_URL') || '/icon-192.png';
+      const badge =
+        payload.badge || this.configService.get<string>('PUSH_BADGE_URL') || '/badge-72.png';
+
       const stringifiedPayload = JSON.stringify({
         title: payload.title,
         body: payload.body,
-        icon: payload.icon || '/icon-192.png',
-        badge: payload.badge || '/badge-72.png',
+        icon,
+        badge,
         data: {
           url: payload.url || '/',
           ...payload.data,

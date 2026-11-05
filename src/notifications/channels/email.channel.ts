@@ -55,7 +55,9 @@ export class EmailChannel {
    * Try 2: Nodemailer / Gmail SMTP (Fallback)
    */
   async send(options: SendEmailOptions): Promise<{ success: boolean; provider: string; id?: string }> {
-    const { to, subject, html } = options;
+    const { to, html } = options;
+    // Subjects must be single-line plain text (blocks header injection via user-supplied names).
+    const subject = options.subject.replace(/[\r\n]+/g, ' ').slice(0, 200);
 
     // 1. Attempt Primary: Resend
     if (this.resendClient) {

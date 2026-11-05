@@ -1,4 +1,4 @@
-import { IsEmail, IsString, MinLength, IsEnum, IsOptional } from 'class-validator';
+import { IsEmail, IsString, MinLength, IsIn, IsOptional } from 'class-validator';
 import { UserRole } from '../../users/entities/user.entity';
 
 export class RegisterDto {
@@ -12,7 +12,9 @@ export class RegisterDto {
   @IsString()
   fullName: string;
 
+  // Public self-registration may ONLY create client or artisan accounts.
+  // Admin / super_admin accounts must never be creatable from this endpoint.
   @IsOptional()
-  @IsEnum(UserRole)
+  @IsIn([UserRole.CLIENT, UserRole.ARTISAN])
   role?: UserRole;
 }

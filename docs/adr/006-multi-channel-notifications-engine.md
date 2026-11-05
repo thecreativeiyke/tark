@@ -82,3 +82,13 @@ We implement a decoupled, resilient **Multi-Channel Notifications Engine** (`Not
 - **Reliability**: A failure in an external email or SMS gateway does not block or roll back core protocol transactions (bidding, escrow funding, handshake verification, dispute settlement). All notification dispatches run asynchronously with internal error isolation.
 - **Cost**: Operating cost in development and staging is exactly **$0**. Transitioning to production SMS only requires updating `SMS_PROVIDER=termii` and providing the production API key.
 - **Security Rule**: Handshake PINs (Job Completion Codes) sent via email or SMS must explicitly warn clients to only disclose the code in-person after physical inspection of artisan work.
+
+## Amendment (2026-11-04) - see [ADR 007](./007-trust-boundaries-and-failure-semantics.md)
+The original text above is kept unchanged. These corrections apply from 2026-11-04:
+1. **The Job Completion Code is 6 digits, not 4.** Every mention of a "4-digit" code above is wrong.
+2. **The code is no longer sent by SMS, push, or stored in the in-app message** (lock-screen exposure to the artisan). It is shown only in the authenticated app (`GET /escrow/:id`) and in the email, which is a deliberate-open channel.
+3. **SMS failures are reported honestly.** The "automatic drop to Level 1" applies in development only. In production a failed or unconfigured SMS returns `success: false`.
+4. **Email and SMS content is sanitised.** User-supplied text is HTML-escaped in emails; links are stripped from SMS; subjects are single-line.
+5. **Web Push icon and badge** are configured with `PUSH_ICON_URL` / `PUSH_BADGE_URL` (absolute https URLs). Relative defaults only work if a frontend serves those files.
+6. **What was and was not verified on 2026-11-03:** email delivery via Resend was verified. In-app feed endpoints were verified. Web Push was only verified at the level of saving and deleting a subscription row; **delivery to a real browser was not tested** (a test harness now exists: `scripts/push-test/`). Real SMS delivery was not achieved (Termii sender ID not approved).
+7. Payout, notification and wallet copy must say "sent to your bank account" (payouts go through Paystack transfers to the artisan's bank), not "credited to your wallet".

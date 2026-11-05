@@ -6,8 +6,24 @@ export interface EmailLayoutOptions {
   actionText?: string;
 }
 
+// Escape text before it is placed inside HTML. Names, job titles and dispute text are
+// written by users: without this, someone could send a phishing email from Tark's
+// own sender address.
+export function escapeHtml(value: unknown): string {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 export function renderEmailLayout(options: EmailLayoutOptions): string {
-  const { title, previewText, bodyHtml, actionUrl, actionText } = options;
+  const { bodyHtml } = options;
+  const title = escapeHtml(options.title);
+  const previewText = options.previewText ? escapeHtml(options.previewText) : undefined;
+  const actionText = options.actionText ? escapeHtml(options.actionText) : undefined;
+  const actionUrl = options.actionUrl ? escapeHtml(options.actionUrl) : undefined;
 
   const actionButton = actionUrl && actionText ? `
     <table role="presentation" border="0" cellpadding="0" cellspacing="0" style="margin: 28px 0;">

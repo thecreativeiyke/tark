@@ -1,9 +1,16 @@
-import { renderEmailLayout } from './email-layout.template';
+import { renderEmailLayout, escapeHtml as esc } from './email-layout.template';
 
 export interface EmailRenderResult {
   subject: string;
   html: string;
 }
+
+const ngn = (val: number) =>
+  new Intl.NumberFormat('en-NG', { style: 'currency', currency: 'NGN' }).format(val);
+
+// NOTE ON ESCAPING: every value that a user can type (names, job titles, dispute text)
+// is passed through esc() before it goes into the HTML body. Subjects are plain text
+// (not HTML), so they use the raw value; the email channel strips line breaks from them.
 
 export const EmailTemplates = {
   /**
@@ -17,16 +24,16 @@ export const EmailTemplates = {
     completionTimeDays?: number;
     viewBidUrl?: string;
   }): EmailRenderResult {
-    const formattedAmount = new Intl.NumberFormat('en-NG', {
-      style: 'currency',
-      currency: 'NGN',
-    }).format(data.bidAmount);
+    const formattedAmount = ngn(data.bidAmount);
+    const clientName = esc(data.clientName);
+    const artisanName = esc(data.artisanName);
+    const jobTitle = esc(data.jobTitle);
 
     const bodyHtml = `
-      <p style="margin: 0 0 16px 0;">Hello ${data.clientName},</p>
+      <p style="margin: 0 0 16px 0;">Hello ${clientName},</p>
       <p style="margin: 0 0 20px 0;">
-        Artisan <strong style="color: #FFFFFF;">${data.artisanName}</strong> just placed a bid on your job: 
-        <span style="color: #10B981; font-weight: 600;">"${data.jobTitle}"</span>.
+        Artisan <strong style="color: #FFFFFF;">${artisanName}</strong> just placed a bid on your job:
+        <span style="color: #10B981; font-weight: 600;">"${jobTitle}"</span>.
       </p>
 
       <div style="background-color: #0F1420; border: 1px solid #232B3B; border-radius: 10px; padding: 20px; margin: 20px 0;">
@@ -39,7 +46,7 @@ export const EmailTemplates = {
             data.completionTimeDays
               ? `<tr>
                   <td style="color: #94A3B8; font-size: 13px; padding-top: 8px; border-top: 1px solid #1E2738;">Est. Delivery</td>
-                  <td align="right" style="color: #F8FAFC; font-size: 14px; font-weight: 600; padding-top: 8px; border-top: 1px solid #1E2738;">${data.completionTimeDays} Day(s)</td>
+                  <td align="right" style="color: #F8FAFC; font-size: 14px; font-weight: 600; padding-top: 8px; border-top: 1px solid #1E2738;">${Number(data.completionTimeDays)} Day(s)</td>
                 </tr>`
               : ''
           }
@@ -74,31 +81,32 @@ export const EmailTemplates = {
     tranche1Amount: number;
     actionUrl?: string;
   }): EmailRenderResult {
-    const formatNgn = (val: number) =>
-      new Intl.NumberFormat('en-NG', { style: 'currency', currency: 'NGN' }).format(val);
+    const artisanName = esc(data.artisanName);
+    const clientName = esc(data.clientName);
+    const jobTitle = esc(data.jobTitle);
 
     const bodyHtml = `
-      <p style="margin: 0 0 16px 0;">Hello ${data.artisanName},</p>
+      <p style="margin: 0 0 16px 0;">Hello ${artisanName},</p>
       <p style="margin: 0 0 20px 0;">
-        Great news! Client <strong style="color: #FFFFFF;">${data.clientName}</strong> has deposited and locked the full project budget in Tark Safe-Lock for: 
-        <span style="color: #10B981; font-weight: 600;">"${data.jobTitle}"</span>.
+        Great news! Client <strong style="color: #FFFFFF;">${clientName}</strong> has deposited and locked the full project budget in Tark Safe-Lock for:
+        <span style="color: #10B981; font-weight: 600;">"${jobTitle}"</span>.
       </p>
 
       <div style="background-color: #0F1420; border: 1px solid #232B3B; border-radius: 10px; padding: 20px; margin: 20px 0;">
         <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0">
           <tr>
             <td style="color: #94A3B8; font-size: 13px; text-transform: uppercase;">Total Safe-Lock Escrow</td>
-            <td align="right" style="color: #F8FAFC; font-size: 16px; font-weight: 700;">${formatNgn(data.totalBudget)}</td>
+            <td align="right" style="color: #F8FAFC; font-size: 16px; font-weight: 700;">${ngn(data.totalBudget)}</td>
           </tr>
           <tr>
-            <td style="color: #94A3B8; font-size: 13px; text-transform: uppercase; padding-top: 10px; border-top: 1px solid #1E2738;">Start-Work Mobilization (50%)</td>
-            <td align="right" style="color: #10B981; font-size: 18px; font-weight: 800; padding-top: 10px; border-top: 1px solid #1E2738;">${formatNgn(data.tranche1Amount)}</td>
+            <td style="color: #94A3B8; font-size: 13px; text-transform: uppercase; padding-top: 10px; border-top: 1px solid #1E2738;">Start-Work Mobilization</td>
+            <td align="right" style="color: #10B981; font-size: 18px; font-weight: 800; padding-top: 10px; border-top: 1px solid #1E2738;">${ngn(data.tranche1Amount)}</td>
           </tr>
         </table>
       </div>
 
       <p style="margin: 0 0 12px 0; font-size: 14px; color: #94A3B8;">
-        Your funds are 100% secured. You may now reach out to coordinate work schedule and site arrival.
+        The client's money is held safely by Tark. You may now reach out to coordinate the work schedule and site arrival.
       </p>
     `;
 
@@ -115,7 +123,7 @@ export const EmailTemplates = {
   },
 
   /**
-   * 3. Tranche 1 Released (Start-Work Mobilization disbursed to artisan)
+   * 3. Tranche 1 Released (Start-Work Mobilization sent to the artisan's bank account)
    */
   tranche1Released(data: {
     recipientName: string;
@@ -123,16 +131,16 @@ export const EmailTemplates = {
     amount: number;
     actionUrl?: string;
   }): EmailRenderResult {
-    const formattedAmount = new Intl.NumberFormat('en-NG', {
-      style: 'currency',
-      currency: 'NGN',
-    }).format(data.amount);
+    const formattedAmount = ngn(data.amount);
+    const recipientName = esc(data.recipientName);
+    const jobTitle = esc(data.jobTitle);
 
     const bodyHtml = `
-      <p style="margin: 0 0 16px 0;">Hello ${data.recipientName},</p>
+      <p style="margin: 0 0 16px 0;">Hello ${recipientName},</p>
       <p style="margin: 0 0 20px 0;">
-        The <strong style="color: #10B981;">Start-Work Mobilization (${formattedAmount})</strong> for job 
-        <strong style="color: #FFFFFF;">"${data.jobTitle}"</strong> has been successfully credited to the artisan's Tark in-app wallet.
+        The <strong style="color: #10B981;">Start-Work Mobilization (${formattedAmount})</strong> for job
+        <strong style="color: #FFFFFF;">"${jobTitle}"</strong> has been sent to your bank account.
+        Depending on your bank, it can take a few minutes to show.
       </p>
       <p style="margin: 0 0 12px 0; font-size: 14px; color: #94A3B8;">
         Work is officially in progress. Remember to document progress with before-and-after photos via the app.
@@ -140,19 +148,20 @@ export const EmailTemplates = {
     `;
 
     return {
-      subject: `Start-Work Mobilization Released: ${formattedAmount}`,
+      subject: `Start-Work Mobilization Sent: ${formattedAmount}`,
       html: renderEmailLayout({
-        title: `Mobilization Disbursed`,
-        previewText: `${formattedAmount} released for "${data.jobTitle}".`,
+        title: `Mobilization Sent`,
+        previewText: `${formattedAmount} sent to your bank account for "${data.jobTitle}".`,
         bodyHtml,
-        actionUrl: data.actionUrl || `https://tark.ng/wallet`,
-        actionText: `View Wallet Balance`,
+        actionUrl: data.actionUrl || `https://tark.ng/jobs`,
+        actionText: `View Job`,
       }),
     };
   },
 
   /**
    * 4. Handshake Ready / Completion Code Generated (Sent to Client)
+   * The code is 6 digits (see EscrowService.initiateHandshake).
    */
   handshakeReady(data: {
     clientName: string;
@@ -161,25 +170,30 @@ export const EmailTemplates = {
     handshakePin: string;
     actionUrl?: string;
   }): EmailRenderResult {
+    const clientName = esc(data.clientName);
+    const artisanName = esc(data.artisanName);
+    const jobTitle = esc(data.jobTitle);
+    const pin = esc(data.handshakePin);
+
     const bodyHtml = `
-      <p style="margin: 0 0 16px 0;">Hello ${data.clientName},</p>
+      <p style="margin: 0 0 16px 0;">Hello ${clientName},</p>
       <p style="margin: 0 0 20px 0;">
-        Artisan <strong style="color: #FFFFFF;">${data.artisanName}</strong> has submitted proof of work and marked 
-        <strong style="color: #FFFFFF;">"${data.jobTitle}"</strong> as completed.
+        Artisan <strong style="color: #FFFFFF;">${artisanName}</strong> has submitted proof of work and marked
+        <strong style="color: #FFFFFF;">"${jobTitle}"</strong> as completed.
       </p>
 
       <div style="background-color: #0F1420; border: 2px solid #F59E0B; border-radius: 12px; padding: 24px; text-align: center; margin: 24px 0;">
         <span style="display: block; color: #94A3B8; font-size: 12px; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px;">
-          Your 4-Digit Job Completion Code
+          Your 6-Digit Job Completion Code
         </span>
         <span style="font-size: 36px; font-weight: 900; letter-spacing: 10px; color: #F59E0B; font-family: monospace;">
-          ${data.handshakePin}
+          ${pin}
         </span>
       </div>
 
       <div style="background-color: rgba(245, 158, 11, 0.08); border-left: 3px solid #F59E0B; padding: 12px 16px; margin: 20px 0; border-radius: 4px;">
         <p style="margin: 0; font-size: 13px; color: #FCD34D;">
-          ⚠️ <strong>Security Rule:</strong> Inspect the completed work in-person before sharing this code. Once the artisan enters this code in their app, final completion funds are permanently disbursed.
+          ⚠️ <strong>Security Rule:</strong> Inspect the completed work in person before sharing this code. Once the artisan enters this code in their app, the final payment is released and cannot be undone. The code expires in 15 minutes.
         </p>
       </div>
     `;
@@ -187,8 +201,8 @@ export const EmailTemplates = {
     return {
       subject: `Job Completion Code Ready: "${data.jobTitle}"`,
       html: renderEmailLayout({
-        title: `Job Completion Handshake`,
-        previewText: `Inspect work and share your 4-digit code to finalize "${data.jobTitle}".`,
+        title: `Job Completion Code`,
+        previewText: `Inspect the work and, only if you are satisfied, share your 6-digit code to finalize "${data.jobTitle}".`,
         bodyHtml,
         actionUrl: data.actionUrl || `https://tark.ng/jobs`,
         actionText: `Inspect Proof-of-Work`,
@@ -208,47 +222,48 @@ export const EmailTemplates = {
     accountMasked?: string;
     actionUrl?: string;
   }): EmailRenderResult {
-    const formatNgn = (val: number) =>
-      new Intl.NumberFormat('en-NG', { style: 'currency', currency: 'NGN' }).format(val);
+    const artisanName = esc(data.artisanName);
+    const jobTitle = esc(data.jobTitle);
+    const accountMasked = data.accountMasked ? esc(data.accountMasked) : '';
 
     const bodyHtml = `
-      <p style="margin: 0 0 16px 0;">Hello ${data.artisanName},</p>
+      <p style="margin: 0 0 16px 0;">Hello ${artisanName},</p>
       <p style="margin: 0 0 20px 0;">
-        Handshake verified! Your final payment for <strong style="color: #FFFFFF;">"${data.jobTitle}"</strong> has been successfully settled and transferred.
+        Completion code verified! Your final payment for <strong style="color: #FFFFFF;">"${jobTitle}"</strong> has been settled and sent.
       </p>
 
       <div style="background-color: #0F1420; border: 1px solid #232B3B; border-radius: 10px; padding: 20px; margin: 20px 0;">
         <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0">
           <tr>
             <td style="color: #94A3B8; font-size: 13px;">Total Job Budget</td>
-            <td align="right" style="color: #F8FAFC; font-size: 14px; font-weight: 600;">${formatNgn(data.totalJobBudget)}</td>
+            <td align="right" style="color: #F8FAFC; font-size: 14px; font-weight: 600;">${ngn(data.totalJobBudget)}</td>
           </tr>
           <tr>
-            <td style="color: #94A3B8; font-size: 13px; padding-top: 8px;">Tark Protocol Fee (5%)</td>
-            <td align="right" style="color: #EF4444; font-size: 14px; font-weight: 600; padding-top: 8px;">-${formatNgn(data.platformFeeAmount)}</td>
+            <td style="color: #94A3B8; font-size: 13px; padding-top: 8px;">Tark Service Fee</td>
+            <td align="right" style="color: #EF4444; font-size: 14px; font-weight: 600; padding-top: 8px;">-${ngn(data.platformFeeAmount)}</td>
           </tr>
           <tr>
-            <td style="color: #94A3B8; font-size: 14px; font-weight: 700; padding-top: 12px; border-top: 1px solid #1E2738;">Net Disbursed</td>
-            <td align="right" style="color: #10B981; font-size: 20px; font-weight: 800; padding-top: 12px; border-top: 1px solid #1E2738;">${formatNgn(data.disbursedAmount)}</td>
+            <td style="color: #94A3B8; font-size: 14px; font-weight: 700; padding-top: 12px; border-top: 1px solid #1E2738;">Final Payment Sent</td>
+            <td align="right" style="color: #10B981; font-size: 20px; font-weight: 800; padding-top: 12px; border-top: 1px solid #1E2738;">${ngn(data.disbursedAmount)}</td>
           </tr>
         </table>
       </div>
 
       ${
-        data.accountMasked
-          ? `<p style="font-size: 13px; color: #94A3B8; margin: 0 0 12px 0;">Funds routed directly to bank account ending in <strong>${data.accountMasked}</strong>.</p>`
+        accountMasked
+          ? `<p style="font-size: 13px; color: #94A3B8; margin: 0 0 12px 0;">Sent to your bank account ending in <strong>${accountMasked}</strong>.</p>`
           : ''
       }
     `;
 
     return {
-      subject: `Payment Settled: ${formatNgn(data.disbursedAmount)} for "${data.jobTitle}"`,
+      subject: `Payment Sent: ${ngn(data.disbursedAmount)} for "${data.jobTitle}"`,
       html: renderEmailLayout({
-        title: `Final Payment Settled`,
-        previewText: `${formatNgn(data.disbursedAmount)} successfully transferred.`,
+        title: `Final Payment Sent`,
+        previewText: `${ngn(data.disbursedAmount)} sent to your bank account.`,
         bodyHtml,
-        actionUrl: data.actionUrl || `https://tark.ng/wallet`,
-        actionText: `View Payout Receipt`,
+        actionUrl: data.actionUrl || `https://tark.ng/jobs`,
+        actionText: `View Job`,
       }),
     };
   },
@@ -264,26 +279,32 @@ export const EmailTemplates = {
     resolutionNotes?: string;
     actionUrl?: string;
   }): EmailRenderResult {
+    const recipientName = esc(data.recipientName);
+    const jobTitle = esc(data.jobTitle);
+    const status = esc(data.status);
+    const reason = esc(data.disputeReason);
+    const notes = data.resolutionNotes ? esc(data.resolutionNotes) : '';
+
     const bodyHtml = `
-      <p style="margin: 0 0 16px 0;">Hello ${data.recipientName},</p>
+      <p style="margin: 0 0 16px 0;">Hello ${recipientName},</p>
       <p style="margin: 0 0 20px 0;">
-        There is an official update regarding the Tark Resolution Desk ticket on: 
-        <strong style="color: #FFFFFF;">"${data.jobTitle}"</strong>.
+        There is an official update regarding the Tark Resolution Desk ticket on:
+        <strong style="color: #FFFFFF;">"${jobTitle}"</strong>.
       </p>
 
       <div style="background-color: #0F1420; border-left: 3px solid #3B82F6; border-radius: 6px; padding: 16px 20px; margin: 20px 0;">
         <p style="margin: 0 0 6px 0; font-size: 12px; color: #94A3B8; text-transform: uppercase;">Current Status</p>
-        <p style="margin: 0 0 12px 0; font-size: 16px; font-weight: 700; color: #60A5FA;">${data.status}</p>
-        
+        <p style="margin: 0 0 12px 0; font-size: 16px; font-weight: 700; color: #60A5FA;">${status}</p>
+
         <p style="margin: 0 0 6px 0; font-size: 12px; color: #94A3B8; text-transform: uppercase;">Issue Summary</p>
-        <p style="margin: 0; font-size: 14px; color: #CBD5E1;">"${data.disputeReason}"</p>
+        <p style="margin: 0; font-size: 14px; color: #CBD5E1;">"${reason}"</p>
       </div>
 
       ${
-        data.resolutionNotes
+        notes
           ? `<div style="background-color: #121824; border: 1px solid #1F2737; border-radius: 8px; padding: 16px; margin: 16px 0;">
               <p style="margin: 0 0 4px 0; font-size: 12px; color: #94A3B8; font-weight: 600;">Resolution Verdict Notes:</p>
-              <p style="margin: 0; font-size: 14px; color: #E2E8F0;">${data.resolutionNotes}</p>
+              <p style="margin: 0; font-size: 14px; color: #E2E8F0;">${notes}</p>
             </div>`
           : ''
       }
@@ -296,7 +317,7 @@ export const EmailTemplates = {
         previewText: `Status update: ${data.status} for "${data.jobTitle}".`,
         bodyHtml,
         actionUrl: data.actionUrl || `https://tark.ng/disputes`,
-        actionText: `Open Dispute Docket`,
+        actionText: `Open Case`,
       }),
     };
   },

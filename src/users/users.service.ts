@@ -26,8 +26,12 @@ export class UsersService {
     }
     const hashedPassword = await bcrypt.hash(registerDto.password, 10);
     const user = this.usersRepository.create({
-      ...registerDto,
+      email: registerDto.email,
       password: hashedPassword,
+      fullName: registerDto.fullName,
+      // Never copy a role from the request beyond the two public roles.
+      role:
+        registerDto.role === UserRole.ARTISAN ? UserRole.ARTISAN : UserRole.CLIENT,
     });
     return this.usersRepository.save(user);
   }

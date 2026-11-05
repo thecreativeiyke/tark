@@ -191,8 +191,17 @@ export class EscrowService {
   // CREATE — everything that moves money is taken from the accepted bid
   // stored on the job, never trusted from the request body.
   // ─────────────────────────────────────────────────────────────────────
-  async create(createEscrowDto: CreateEscrowDto, clientId: string) {
-    const job = await this.jobsService.findOne(createEscrowDto.jobId);
+  // `manager` is passed by callers already inside a transaction (e.g. accepting a bid) so the job and
+  // escrow are read/written on the SAME connection. Without it, a separate connection cannot see the
+  // transaction's uncommitted job update (artisan + tranche amounts) and the checks below always fail.
+  async create(createEscrowDto: CreateEscrowDto, clientId: string, manager?: EntityManager) {
+    const escrowRepo = manager ? manager.getRepository(EscrowTransaction) : this.escrowRepository;
+    const job = manager
+      ? await manager.findOneBy(Job, { id: createEscrowDto.jobId })
+      : await this.jobsService.findOne(createEscrowDto.jobId);
+    if (!job) {
+      throw new NotFoundException('Job not found');
+    }
 
     if (job.clientId !== clientId) {
       throw new ForbiddenException('Only the job owner can create an escrow for this job');
@@ -215,7 +224,7 @@ export class EscrowService {
       throw new BadRequestException('The tranche amounts do not match the accepted bid');
     }
 
-    const existing = await this.escrowRepository.findOneBy({ jobId: job.id });
+    const existing = await escrowRepo.findOneBy({ jobId: job.id });
     if (existing) {
       throw new BadRequestException('An escrow already exists for this job');
     }
@@ -224,7 +233,7 @@ export class EscrowService {
     // 5% Tark Protocol Fee (calculated on total job budget, retained by platform upon settlement)
     const platformFee = Math.round(totalBudget * 0.05 * 100) / 100;
 
-    const escrow = this.escrowRepository.create({
+    const escrow = escrowRepo.create({
       jobId: job.id,
       clientId,
       artisanId: job.artisanId,
@@ -238,7 +247,7 @@ export class EscrowService {
     });
 
     try {
-      return await this.escrowRepository.save(escrow);
+      return await escrowRepo.save(escrow);
     } catch (err: any) {
       // Unique index on jobId: two simultaneous requests, second one loses.
       if ((err?.code ?? err?.driverError?.code) === '23505') {
@@ -558,7 +567,9 @@ export class EscrowService {
           disbursedAmount: netDisbursed,
           platformFeeAmount: fee,
           totalJobBudget: totalJobBudget,
-          accountMasked: artisan?.phoneNumber ? `***${artisan.phoneNumber.slice(-4)}` : undefined,
+          accountMasked: artisan?.payoutAccountIdentifier
+            ? `***${artisan.payoutAccountIdentifier.slice(-4)}`
+            : undefined,
           jobId: job.id,
         });
       })

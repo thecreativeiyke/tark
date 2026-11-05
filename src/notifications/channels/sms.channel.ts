@@ -14,7 +14,7 @@ export class SmsChannel {
   constructor(private readonly configService: ConfigService) {}
 
   /**
-   * Normalize Nigerian mobile numbers to international E.164 format
+   * Normalize Nigerian mobile numbers to international format (no plus sign)
    * e.g. "08012345678" -> "2348012345678"
    */
   private formatPhoneNumber(phone: string): string {
@@ -28,15 +28,25 @@ export class SmsChannel {
     return cleaned;
   }
 
-  async send(options: SendSmsOptions): Promise<{ success: boolean; provider: string; messageId?: string }> {
+  /**
+   * Returns success:true ONLY when a real provider accepted the message.
+   * The console simulator exists for local development and is never used in
+   * production: a failed security-code SMS must be reported as failed.
+   */
+  async send(
+    options: SendSmsOptions,
+  ): Promise<{ success: boolean; provider: string; messageId?: string }> {
     const provider = (this.configService.get<string>('SMS_PROVIDER') || 'mock').toLowerCase();
+    const isProduction = this.configService.get<string>('NODE_ENV') === 'production';
     const formattedPhone = this.formatPhoneNumber(options.to);
 
-    // Level 2: Termii Real Dispatch (Live / Sandbox)
+    // Level 2: Termii real dispatch
     if (provider === 'termii') {
       const apiKey = this.configService.get<string>('TERMII_API_KEY');
-      const senderId = this.configService.get<string>('TERMII_SENDER_ID') || 'N-Alert';
-      const channel = this.configService.get<string>('TERMII_CHANNEL') || 'dnd';
+      const senderId = this.configService.get<string>('TERMII_SENDER_ID') || 'Tark';
+      const channel = this.configService.get<string>('TERMII_CHANNEL') || 'generic';
+      const baseUrl =
+        this.configService.get<string>('TERMII_BASE_URL') || 'https://v4.api.termii.com/api';
 
       if (apiKey && !apiKey.includes('placeholder')) {
         try {
@@ -49,59 +59,48 @@ export class SmsChannel {
             api_key: apiKey,
           };
 
-          const res = await axios.post('https://api.ng.termii.com/api/sms/send', payload, {
+          const res = await axios.post(`${baseUrl}/sms/send`, payload, {
             headers: { 'Content-Type': 'application/json' },
             timeout: 10000,
           });
 
           this.logger.log(
-            `[SMS Delivered] Termii API dispatched to ${formattedPhone} via ${channel} channel (ID: ${res.data?.message_id || 'ok'})`,
+            `[SMS Delivered] Termii accepted message to +${formattedPhone} via ${channel} channel (ID: ${res.data?.message_id || 'ok'})`,
           );
           return { success: true, provider: 'termii', messageId: res.data?.message_id };
         } catch (err: any) {
           const errDetail = err.response?.data?.message || err.message;
-          this.logger.warn(
-            `[Termii Dispatch Failed] Attempt with sender '${senderId}' and channel '${channel}' failed: ${errDetail}. Attempting DND fallback with 'N-Alert'...`,
-          );
-
-          // Retry fallback: DND channel with default N-Alert sender
-          try {
-            const fallbackRes = await axios.post(
-              'https://api.ng.termii.com/api/sms/send',
-              {
-                to: formattedPhone,
-                from: 'N-Alert',
-                sms: options.message,
-                type: 'plain',
-                channel: 'dnd',
-                api_key: apiKey,
-              },
-              { headers: { 'Content-Type': 'application/json' }, timeout: 10000 },
+          if (isProduction) {
+            this.logger.error(
+              `[SMS FAILED] Termii rejected the message to +${formattedPhone}: "${errDetail}". No fallback in production.`,
             );
-
-            this.logger.log(
-              `[SMS Delivered] Termii DND fallback successfully dispatched to ${formattedPhone} (ID: ${fallbackRes.data?.message_id})`,
-            );
-            return { success: true, provider: 'termii', messageId: fallbackRes.data?.message_id };
-          } catch (retryErr: any) {
-            const retryDetail = retryErr.response?.data?.message || retryErr.message;
-            this.logger.warn(
-              `[SMS Fallback Triggered] Termii retry also failed (${retryDetail}). Falling back to Level 1 console mock...`,
-            );
+            return { success: false, provider: 'termii' };
           }
+          this.logger.warn(
+            `[Termii Dispatch Notice] Real SMS to +${formattedPhone} failed: "${errDetail}". Using the DEV console simulator instead (nothing was delivered).`,
+          );
         }
       } else {
-        this.logger.warn('TERMII_API_KEY is not configured. Falling back to Level 1 console mock.');
+        if (isProduction) {
+          this.logger.error('TERMII_API_KEY is not configured. SMS was NOT sent.');
+          return { success: false, provider: 'none' };
+        }
+        this.logger.warn('TERMII_API_KEY is not configured. Using the DEV console simulator.');
       }
     }
 
-    // Level 1: Console Mock & Simulator
+    if (isProduction) {
+      this.logger.error('SMS_PROVIDER is not a live provider. SMS was NOT sent.');
+      return { success: false, provider: 'none' };
+    }
+
+    // Level 1: development console simulator. Nothing is actually delivered.
     this.logger.log(
-      `\n┌────────────────── [SMS MOCK DISPATCH] ──────────────────┐\n` +
-      `│ Recipient : +${formattedPhone}\n` +
-      `│ Provider  : LEVEL 1 CONSOLE SIMULATOR\n` +
-      `│ Message   : "${options.message}"\n` +
-      `└────────────────────────────────────────────────────────┘`,
+      `\n┌────────────────── [SMS MOCK DISPATCH - NOT DELIVERED] ──────────────────┐\n` +
+        `│ Recipient : +${formattedPhone}\n` +
+        `│ Provider  : DEV CONSOLE SIMULATOR\n` +
+        `│ Message   : "${options.message}"\n` +
+        `└──────────────────────────────────────────────────────────────────────┘`,
     );
 
     return { success: true, provider: 'mock' };

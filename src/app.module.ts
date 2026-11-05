@@ -17,6 +17,7 @@ import { ReviewsModule } from './reviews/reviews.module';
 import { DisputesModule } from './disputes/disputes.module';
 import { SupportModule } from './support/support.module';
 import { NotificationsModule } from './notifications/notifications.module';
+import { KycModule } from './kyc/kyc.module';
 
 @Module({
   imports: [
@@ -80,6 +81,7 @@ import { NotificationsModule } from './notifications/notifications.module';
     DisputesModule,
     SupportModule,
     NotificationsModule,
+    KycModule,
   ],
   controllers: [AppController],
   providers: [

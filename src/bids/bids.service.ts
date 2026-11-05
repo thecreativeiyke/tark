@@ -31,6 +31,20 @@ export class BidsService {
       throw new ForbiddenException('Only registered artisans can place bids');
     }
 
+    // Observation-mode gate: only Tark Certified artisans can place bids.
+    // Set KYC_REQUIRED_TO_BID=false in .env to disable it (e.g. for a pilot or while KYC is unfinished).
+    // Default (unset) keeps the gate ON.
+    if (process.env.KYC_REQUIRED_TO_BID !== 'false') {
+      const artisanUser = await this.dataSource
+        .getRepository(User)
+        .findOne({ where: { id: artisanId } });
+      if (!artisanUser || !artisanUser.isCertifiedByTark) {
+        throw new ForbiddenException(
+          'Tark Certification Required: You are currently in observation mode. You must complete your KYC verification at /kyc/submit to unlock bidding.',
+        );
+      }
+    }
+
     const job = await this.jobsService.findOne(dto.jobId);
 
     // An artisan cannot bid on their own posted job
@@ -94,7 +108,7 @@ export class BidsService {
     });
   }
 
-  async findOne(id: string) {
+  async findOne(id: string): Promise<Bid> {
     const bid = await this.bidsRepository.findOneBy({ id });
     if (!bid) {
       throw new NotFoundException(`Bid #${id} not found`);
@@ -158,6 +172,7 @@ export class BidsService {
           tranche2Amount: Number(bid.tranche2Amount),
         },
         clientId,
+        manager, // same transaction: the job update above is not committed yet
       );
 
       return {
