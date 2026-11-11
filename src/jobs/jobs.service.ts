@@ -37,7 +37,7 @@ export class JobsService {
     return this.jobsRepository.save(job);
   }
 
-  async findAll(query: QueryJobDto = {}) {
+  async findAll(query: QueryJobDto = {}, caller?: { userId?: string; role?: string }) {
     const { page = 1, limit = 20, category, status, search } = query;
     const skip = (page - 1) * limit;
 
@@ -67,7 +67,7 @@ export class JobsService {
     const [items, total] = await qb.getManyAndCount();
 
     return {
-      data: items,
+      data: items.map((job) => this.coarsenJob(job, caller)),
       meta: {
         total,
         page,
@@ -77,12 +77,53 @@ export class JobsService {
     };
   }
 
+  /**
+   * Masks exact client street address, coordinates, and contact details from
+   * unauthenticated callers, non-party users, and artisans before escrow is funded.
+   * Full address is only revealed to:
+   * 1. Job owner (client)
+   * 2. Platform Admins
+   * 3. Assigned artisan once escrow is funded (JobStatus.IN_PROGRESS or COMPLETED)
+   */
+  coarsenJob(job: Job, caller?: { userId?: string; role?: string }) {
+    const isOwner = Boolean(caller?.userId && caller.userId === job.clientId);
+    const isAdmin = caller?.role === 'ADMIN' || caller?.role === 'SUPER_ADMIN';
+    const isAssignedAndActive = Boolean(
+      caller?.userId &&
+      caller.userId === job.artisanId &&
+      (job.status === JobStatus.IN_PROGRESS || job.status === JobStatus.COMPLETED),
+    );
+
+    if (isOwner || isAdmin || isAssignedAndActive) {
+      return job;
+    }
+
+    let coarseLocation = job.location;
+    if (coarseLocation && coarseLocation.includes(',')) {
+      const parts = coarseLocation.split(',').map((p) => p.trim());
+      coarseLocation = parts.slice(-2).join(', ');
+    }
+
+    return {
+      ...job,
+      location: coarseLocation,
+      latitude: null,
+      longitude: null,
+      isLocationCoarsened: true,
+    };
+  }
+
   async findOne(id: string) {
     const job = await this.jobsRepository.findOneBy({ id });
     if (!job) {
       throw new NotFoundException(`Job with ID ${id} not found`);
     }
     return job;
+  }
+
+  async findOneForCaller(id: string, caller?: { userId?: string; role?: string }) {
+    const job = await this.findOne(id);
+    return this.coarsenJob(job, caller);
   }
 
   async update(id: string, updateJobDto: UpdateJobDto, userId: string) {

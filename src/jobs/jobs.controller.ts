@@ -15,6 +15,7 @@ import { CreateJobDto } from './dto/create-job.dto';
 import { UpdateJobDto } from './dto/update-job.dto';
 import { QueryJobDto } from './dto/query-job.dto';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
+import { OptionalJwtAuthGuard } from '../auth/guards/optional-jwt-auth.guard';
 
 interface AuthenticatedRequest extends Request {
   user: {
@@ -37,14 +38,16 @@ export class JobsController {
     return this.jobsService.create(createJobDto, req.user.userId);
   }
 
+  @UseGuards(OptionalJwtAuthGuard)
   @Get()
-  findAll(@Query() query: QueryJobDto) {
-    return this.jobsService.findAll(query);
+  findAll(@Query() query: QueryJobDto, @Request() req: any) {
+    return this.jobsService.findAll(query, req.user);
   }
 
+  @UseGuards(OptionalJwtAuthGuard)
   @Get(':id')
-  findOne(@Param('id') id: string) {
-    return this.jobsService.findOne(id);
+  findOne(@Param('id') id: string, @Request() req: any) {
+    return this.jobsService.findOneForCaller(id, req.user);
   }
 
   @UseGuards(JwtAuthGuard)

@@ -225,7 +225,11 @@ export class KycService {
           isCertifiedByTark: r.user?.isCertifiedByTark,
         },
         idType: r.idType,
-        idNumber: r.idNumber,
+        idNumber: r.idNumber
+          ? (r.idNumber.length > 4
+              ? '*'.repeat(r.idNumber.length - 4) + r.idNumber.slice(-4)
+              : '****')
+          : null,
         documentFirstName: r.documentFirstName,
         documentLastName: r.documentLastName,
         status: r.status,

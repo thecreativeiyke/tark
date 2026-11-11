@@ -37,7 +37,11 @@ export class UsersService {
   }
 
   findByEmail(email: string) {
-    return this.usersRepository.findOneBy({ email });
+    return this.usersRepository
+      .createQueryBuilder('user')
+      .addSelect('user.password')
+      .where('LOWER(user.email) = LOWER(:email)', { email })
+      .getOne();
   }
 
   findOne(id: string) {
@@ -63,18 +67,17 @@ export class UsersService {
     radiusKm = 15,
     category?: string,
   ) {
+    // Clamp radius between 1km and 50km to prevent full-country scraping
+    const effectiveRadius = Math.min(Math.max(Number(radiusKm) || 15, 1), 50);
+
     const qb = this.usersRepository
       .createQueryBuilder('user')
       .select([
         'user.id',
         'user.fullName',
-        'user.email',
-        'user.phoneNumber',
         'user.role',
-        'user.isVerified',
         'user.skills',
-        'user.latitude',
-        'user.longitude',
+        'user.isCertifiedByTark',
         'user.createdAt',
       ])
       .addSelect(
@@ -88,9 +91,10 @@ export class UsersService {
         'distance',
       )
       .where('user.role = :role', { role: UserRole.ARTISAN })
+      .andWhere('user.isCertifiedByTark = :certified', { certified: true })
       .andWhere('user.latitude IS NOT NULL')
       .andWhere('user.longitude IS NOT NULL')
-      .setParameters({ lat, lng, radiusKm });
+      .setParameters({ lat, lng, radiusKm: effectiveRadius });
 
     if (category) {
       qb.andWhere(':category = ANY(user.skills)', { category });
@@ -108,11 +112,15 @@ export class UsersService {
 
     const rawAndEntities = await qb.getRawAndEntities();
 
+    // Return sanitized artisan profile with coarse rounded distance
     return rawAndEntities.entities.map((user, index) => ({
-      ...user,
-      distanceKm: parseFloat(
-        Number(rawAndEntities.raw[index].distance).toFixed(2),
-      ),
+      id: user.id,
+      fullName: user.fullName,
+      role: user.role,
+      skills: user.skills,
+      isCertifiedByTark: user.isCertifiedByTark,
+      createdAt: user.createdAt,
+      distanceKm: Math.round(Number(rawAndEntities.raw[index].distance) * 10) / 10,
     }));
   }
 }

@@ -34,7 +34,8 @@ export class UsersController {
     return this.usersService.updateProfile(req.user.userId, updateProfileDto);
   }
 
-  // Public geo query: tighter than the global limit to deter scraping of artisan locations
+  // Authenticated geo query: rate-limited to deter scraping of artisan locations
+  @UseGuards(JwtAuthGuard)
   @Throttle({ default: { limit: 30, ttl: 60000 } })
   @Get('artisans/nearby')
   findNearbyArtisans(

@@ -16,6 +16,7 @@ import { EscrowService } from '../escrow/escrow.service';
 import { EscrowStatus } from '../escrow/entities/escrow-transaction.entity';
 import { User } from '../users/entities/user.entity';
 import { Job } from '../jobs/entities/job.entity';
+import { WalletLedger, WalletLedgerType } from './entities/wallet-ledger.entity';
 import { PaymentGatewayResolver } from './gateways/payment-gateway.resolver';
 
 export interface BankFilterQuery {
@@ -312,6 +313,15 @@ export class PaymentsService {
       user.walletBalance = parseFloat((currentBalance - totalAmount).toFixed(2));
       await manager.save(user);
 
+      const debitLedger = manager.create(WalletLedger, {
+        reference: `wdebit-${escrow.id}-${Date.now()}`,
+        userId: user.id,
+        amount: totalAmount,
+        type: WalletLedgerType.DEBIT,
+        description: `Escrow funding for Job #${escrow.jobId.slice(0, 8)}`,
+      });
+      await manager.save(WalletLedger, debitLedger);
+
       return { remainingBalance: user.walletBalance };
     });
 
@@ -483,9 +493,18 @@ export class PaymentsService {
 
   async handleWebhook(event: any) {
     if (event.event === 'charge.success') {
-      const reference = event.data?.reference;
-      const customerCode = event.data?.customer?.customer_code;
+      const d = event.data ?? {};
+      const reference = typeof d.reference === 'string' ? d.reference.trim() : '';
+      if (!reference) {
+        return { status: 'ignored', message: 'Missing transaction reference' };
+      }
 
+      const amountMinor = Number(d.amount);
+      if (d.status !== 'success' || !Number.isSafeInteger(amountMinor) || amountMinor <= 0) {
+        return { status: 'ignored', message: 'Invalid charge payload' };
+      }
+
+      // 1. Escrow direct checkout path
       const escrow = await this.escrowService.findByReference(reference);
       if (escrow) {
         if (
@@ -495,17 +514,82 @@ export class PaymentsService {
         ) {
           return { status: 'success', message: 'Escrow already funded (idempotent)' };
         }
+
+        const expectedMinor = Math.round((Number(escrow.tranche1Amount) + Number(escrow.tranche2Amount)) * 100);
+        if (amountMinor !== expectedMinor) {
+          this.logger.error(
+            `Escrow funding amount mismatch for ref ${reference}. Expected ${expectedMinor} kobo, received ${amountMinor} kobo.`,
+          );
+          return { status: 'ignored', message: 'Charge amount does not match escrow total' };
+        }
+
+        if (d.currency && escrow.currency && d.currency.toUpperCase() !== escrow.currency.toUpperCase()) {
+          this.logger.error(
+            `Escrow currency mismatch for ref ${reference}. Expected ${escrow.currency}, received ${d.currency}.`,
+          );
+          return { status: 'ignored', message: 'Currency mismatch' };
+        }
+
         await this.escrowService.lockFunds(escrow.id);
         return { status: 'success', message: 'Escrow funded via online checkout' };
       }
 
+      // 2. User wallet top-up path
+      const customerCode = typeof d.customer?.customer_code === 'string' ? d.customer.customer_code.trim() : '';
       if (customerCode) {
-        const user = await this.usersRepository.findOneBy({ paystackCustomerCode: customerCode });
-        if (user) {
-          const amountMajor = Number(event.data.amount) / 100;
+        if (d.currency !== 'NGN') {
+          return { status: 'ignored', message: 'Unsupported wallet currency' };
+        }
+
+        const queryRunner = this.dataSource.createQueryRunner();
+        await queryRunner.connect();
+        await queryRunner.startTransaction();
+
+        try {
+          const existing = await queryRunner.manager.findOne(WalletLedger, {
+            where: { reference },
+          });
+          if (existing) {
+            await queryRunner.rollbackTransaction();
+            return { status: 'success', message: 'Wallet deposit already credited (idempotent)' };
+          }
+
+          const user = await queryRunner.manager.findOne(User, {
+            where: { paystackCustomerCode: customerCode },
+            lock: { mode: 'pessimistic_write' },
+          });
+
+          if (!user) {
+            await queryRunner.rollbackTransaction();
+            this.logger.error(`Webhook received for unknown paystackCustomerCode: ${customerCode}, ref: ${reference}`);
+            return { status: 'ignored', message: 'User not found for customer code' };
+          }
+
+          const amountMajor = amountMinor / 100;
+
+          const ledger = queryRunner.manager.create(WalletLedger, {
+            reference,
+            userId: user.id,
+            amount: amountMajor,
+            type: WalletLedgerType.CREDIT,
+            description: `Paystack deposit ref: ${reference}`,
+          });
+          await queryRunner.manager.save(WalletLedger, ledger);
+
           user.walletBalance = Number(user.walletBalance) + amountMajor;
-          await this.usersRepository.save(user);
+          await queryRunner.manager.save(User, user);
+
+          await queryRunner.commitTransaction();
           return { status: 'success', message: `Wallet credited with NGN ${amountMajor}` };
+        } catch (err: any) {
+          await queryRunner.rollbackTransaction();
+          if (err.code === '23505') {
+            return { status: 'success', message: 'Wallet deposit already credited (idempotent)' };
+          }
+          this.logger.error(`Failed to credit wallet for ref ${reference}: ${err.message}`, err.stack);
+          throw err;
+        } finally {
+          await queryRunner.release();
         }
       }
     }

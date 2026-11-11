@@ -29,6 +29,39 @@
 
 ## 🗓️ Session Log
 
+### 🗓️ 2026-11-11 — Session 11: Red-Team Active Penetration Hardening (Phases 1 & 2) — 100% Repelled
+- **Author**: Lead Engineers: Claude (Principal Adversary Audit & Cross-Check) & Antigravity / Gemini (Defense Architecture, Active Exploitation & Live Verification)
+- **Tag**: `[FLAGGED & FIXED]` & `[AUDIT]` & `[SHIPPED]` — Full rationale in [ADR 009](./docs/adr/009-security-hardening-phase1-phase2.md)
+
+#### ⚔️ Vulnerabilities Flagged by Audit & Fixed:
+1. **Webhook Replay Double-Spend (C-1, P-2)**:
+   - Created `wallet_ledgers` table with a `UNIQUE` constraint on `reference`.
+   - `PaymentsService.handleWebhook` now acquires `pessimistic_write` row lock on `User`, writes ledger records, validates positive safe integer amounts (`amountMinor`), and safely deduplicates retries (code `23505`).
+2. **Handshake PIN Brute-Force & Reset Lockout Loop (C-2, P-1)**:
+   - Added `handshakeCycles` and `handshakeLockedUntil` columns to `EscrowTransaction`.
+   - Differentiated reset logic: honest 15-min PIN expiry resets without penalty, while 5 consecutive incorrect guesses trigger exponential backoff cooldown ($15 \times 2^{n-1}$ minutes, capped at 24 hours).
+   - Adversary calls to `POST /escrow/:id/initiate-handshake` during cooldown are blocked with 400 Bad Request.
+3. **Tranche Split Integrity & Integer Math (C-3, P-3)**:
+   - Built centralized `src/escrow/escrow-policy.ts` using integer kobo conversion (`toMinorUnits`).
+   - Enforces 30%–50% Start-Work Mobilization (Tranche 1) and exact kobo balance ($T_1 + T_2 = \text{Total}$).
+   - `BidsService.acceptBid` re-validates tranche rules at acceptance time to block legacy uncompliant bids.
+4. **Wallet Debit Auditability (P-6)**:
+   - `PaymentsService.fundEscrowWithWallet` writes a `WalletLedger` DEBIT row within the deduction transaction.
+   - Added PostgreSQL `wallet_sane` CHECK constraint on `"user"` table ensuring non-negative, non-NaN balance.
+5. **PII, IDOR & Access Control Shields (H-1, H-2, H-3, H-4, H-12)**:
+   - **Artisan Privacy (H-1)**: `GET /users/artisans/nearby` now authenticated (`JwtAuthGuard`), throttled, filters out uncertified artisans, and strips email, phone, and exact GPS coordinates.
+   - **Job Location Coarsening (H-2)**: `GET /jobs` and `GET /jobs/:id` with `OptionalJwtAuthGuard` redact address to city/state and nullify GPS coordinates for anonymous users and non-owners.
+   - **Bid Access Scoping (H-3)**: `GET /bids/job/:jobId` and `GET /bids/:id` now require JWT auth and enforce strict ownership boundaries.
+   - **Password Hash Redaction (H-4)**: `User.password` marked `@Column({ select: false })` — hash never leaks in `/auth/me` or relation queries.
+   - **Support AI BOLA Defense (H-12)**: `SupportService.buildUserContext` verifies caller is a party to the referenced job/escrow before feeding job data into AI context.
+
+#### 🧪 Live Verification — ALL ATTACKS 100% REPELLED ✅:
+- **Phase 1 Active Exploit Suite (`scripts/redteam-active-hack-phase1.js`)**: 5 attacks (100% upfront bid, skewed split, decimal slop, PIN lockout bypass, webhook replay) → **100% Repelled**.
+- **Phase 2 Active Exploit Suite (`scripts/redteam-active-hack-phase2.js`)**: 6 attacks (password leak, job location IDOR, bid IDOR, nearby artisan scraping, malformed webhook injection, support BOLA) → **100% Repelled**.
+- Database automatically cleaned of test users upon completion.
+
+---
+
 ### 🗓️ 2026-11-05 — Session 10: Artisan KYC & Verification Desk Shipped & Verified [100% Live]
 - **Author**: Lead Engineer (AI Model: Gemini / Antigravity) & Ikechukwu Alaeto (Founder)
 - **Tag**: `[SHIPPED]` & `[AUDIT]` & `[DECISION]` — Full rationale in [ADR 008](./docs/adr/008-artisan-kyc-verification-desk.md)

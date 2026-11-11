@@ -33,14 +33,22 @@ export class BidsController {
     return this.bidsService.create(dto, req.user.userId, req.user.role);
   }
 
+  @UseGuards(JwtAuthGuard)
   @Get('job/:jobId')
-  findByJob(@Param('jobId') jobId: string) {
-    return this.bidsService.findByJob(jobId);
+  findByJob(
+    @Param('jobId') jobId: string,
+    @Request() req: AuthenticatedRequest,
+  ) {
+    return this.bidsService.findByJobForUser(jobId, req.user.userId, req.user.role);
   }
 
+  @UseGuards(JwtAuthGuard)
   @Get(':id')
-  findOne(@Param('id') id: string) {
-    return this.bidsService.findOne(id);
+  findOne(
+    @Param('id') id: string,
+    @Request() req: AuthenticatedRequest,
+  ) {
+    return this.bidsService.findOneForUser(id, req.user.userId, req.user.role);
   }
 
   @UseGuards(JwtAuthGuard)

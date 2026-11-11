@@ -1,3 +1,4 @@
+import { toMinorUnits, isTranche1Compliant, tranche1PolicyMessage } from './escrow-policy';
 import {
   Injectable,
   NotFoundException,
@@ -77,10 +78,23 @@ export class EscrowService {
     return a.length === b.length && crypto.timingSafeEqual(a, b);
   }
 
-  private resetHandshake(escrow: EscrowTransaction) {
+  private resetHandshake(escrow: EscrowTransaction, opts = { penalize: false }) {
     escrow.handshakePin = null;
     escrow.handshakeExpiresAt = null;
     escrow.handshakePinAttempts = 0;
+
+    if (opts.penalize) {
+      escrow.handshakeCycles = (escrow.handshakeCycles || 0) + 1;
+      // Exponential lockout cooldown: 15min * 2^(cycles - 1), capped at 24 hours (1440 mins)
+      const mins = Math.min(15 * Math.pow(2, escrow.handshakeCycles - 1), 24 * 60);
+      escrow.handshakeLockedUntil = new Date(Date.now() + mins * 60 * 1000);
+      if (escrow.handshakeCycles >= 3) {
+        this.logger.warn(
+          `Escrow #${escrow.id} has reached ${escrow.handshakeCycles} lockout cycles. Human ops review recommended.`,
+        );
+      }
+    }
+
     escrow.totalStatus =
       escrow.tranche1Status === TrancheStatus.RELEASED
         ? EscrowStatus.TRANCHE_1_RELEASED
@@ -227,6 +241,12 @@ export class EscrowService {
     const existing = await escrowRepo.findOneBy({ jobId: job.id });
     if (existing) {
       throw new BadRequestException('An escrow already exists for this job');
+    }
+
+    const totalBudgetMinor = toMinorUnits(Number(job.tranche1Amount) + Number(job.tranche2Amount));
+    const t1Minor = toMinorUnits(job.tranche1Amount);
+    if (!isTranche1Compliant(t1Minor, totalBudgetMinor)) {
+      throw new BadRequestException(`Cannot create escrow: ${tranche1PolicyMessage()}`);
     }
 
     const totalBudget = Number(job.tranche1Amount) + Number(job.tranche2Amount);
@@ -430,11 +450,26 @@ export class EscrowService {
       if (escrow.artisanId !== artisanId) {
         throw new ForbiddenException('Only the assigned artisan can initiate the handshake');
       }
+      // If a handshake was pending but expired, reset it without penalty so artisan can re-initiate
+      if (
+        escrow.totalStatus === EscrowStatus.HANDSHAKE_PENDING &&
+        escrow.handshakeExpiresAt &&
+        new Date() > new Date(escrow.handshakeExpiresAt)
+      ) {
+        this.resetHandshake(escrow, { penalize: false });
+      }
+
       if (
         escrow.totalStatus !== EscrowStatus.FUNDS_LOCKED &&
         escrow.totalStatus !== EscrowStatus.TRANCHE_1_RELEASED
       ) {
         throw new BadRequestException('Cannot initiate handshake at this stage');
+      }
+
+      if (escrow.handshakeLockedUntil && new Date() < new Date(escrow.handshakeLockedUntil)) {
+        throw new BadRequestException(
+          `Handshake is temporarily locked out due to multiple failed PIN attempts. Locked until: ${new Date(escrow.handshakeLockedUntil).toISOString()}`,
+        );
       }
 
       if (!proofOfWorkUrls || proofOfWorkUrls.length === 0) {
@@ -513,22 +548,30 @@ export class EscrowService {
       // Attempts are checked BEFORE the PIN, so a correct guess after too many
       // failures is still rejected.
       if (escrow.handshakePinAttempts >= MAX_PIN_ATTEMPTS) {
-        this.resetHandshake(escrow);
+        this.resetHandshake(escrow, { penalize: true });
         await manager.save(EscrowTransaction, escrow);
         return {
           rejectedMessage:
-            'Too many incorrect attempts. The PIN has been invalidated. Please initiate a new handshake.',
+            `Too many incorrect attempts. Handshake is locked until ${escrow.handshakeLockedUntil?.toISOString()}.`,
         };
       }
 
       if (new Date() > escrow.handshakeExpiresAt) {
-        this.resetHandshake(escrow);
+        this.resetHandshake(escrow, { penalize: false });
         await manager.save(EscrowTransaction, escrow);
         return { rejectedMessage: 'Handshake PIN has expired. Please initiate a new one.' };
       }
 
       if (!this.pinsMatch(escrow.handshakePin, pin)) {
         escrow.handshakePinAttempts += 1;
+        if (escrow.handshakePinAttempts >= MAX_PIN_ATTEMPTS) {
+          this.resetHandshake(escrow, { penalize: true });
+          await manager.save(EscrowTransaction, escrow);
+          return {
+            rejectedMessage:
+              `Too many incorrect attempts. Handshake is locked until ${escrow.handshakeLockedUntil?.toISOString()}.`,
+          };
+        }
         await manager.save(EscrowTransaction, escrow);
         const remaining = MAX_PIN_ATTEMPTS - escrow.handshakePinAttempts;
         return {

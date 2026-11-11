@@ -1,3 +1,4 @@
+import { toMinorUnits, isTranche1Compliant, tranche1PolicyMessage } from '../escrow/escrow-policy';
 import {
   Injectable,
   NotFoundException,
@@ -56,11 +57,17 @@ export class BidsService {
       throw new BadRequestException('Cannot bid on a job that is not OPEN');
     }
 
-    const trancheSum = Number(dto.tranche1Amount) + Number(dto.tranche2Amount);
-    if (Math.round(trancheSum) !== Math.round(Number(dto.amount))) {
-      throw new BadRequestException(
-        'Tranche 1 + Tranche 2 must add up exactly to the total bid amount',
-      );
+    // Exact minor kobo arithmetic (integer precision, zero floating-point slop)
+    const totalKobo = toMinorUnits(dto.amount);
+    const t1Kobo = toMinorUnits(dto.tranche1Amount);
+    const t2Kobo = toMinorUnits(dto.tranche2Amount);
+
+    if (t1Kobo + t2Kobo !== totalKobo) {
+      throw new BadRequestException('Tranche 1 + Tranche 2 must sum exactly to the total bid amount');
+    }
+
+    if (!isTranche1Compliant(t1Kobo, totalKobo)) {
+      throw new BadRequestException(tranche1PolicyMessage());
     }
 
     // One pending bid per artisan per job
@@ -108,12 +115,52 @@ export class BidsService {
     });
   }
 
+  /**
+   * Scoped bid access:
+   * - Job owner (client) and Platform Admins can see all bids on the job.
+   * - Artisans can only see their own bid on the job.
+   */
+  async findByJobForUser(jobId: string, userId: string, role: string) {
+    const job = await this.jobsService.findOne(jobId);
+    if (!job) {
+      throw new NotFoundException(`Job #${jobId} not found`);
+    }
+
+    if (role === 'ADMIN' || role === 'SUPER_ADMIN' || job.clientId === userId) {
+      return this.bidsRepository.find({
+        where: { jobId },
+        order: { createdAt: 'DESC' },
+      });
+    }
+
+    return this.bidsRepository.find({
+      where: { jobId, artisanId: userId },
+      order: { createdAt: 'DESC' },
+    });
+  }
+
   async findOne(id: string): Promise<Bid> {
     const bid = await this.bidsRepository.findOneBy({ id });
     if (!bid) {
       throw new NotFoundException(`Bid #${id} not found`);
     }
     return bid;
+  }
+
+  async findOneForUser(id: string, userId: string, role: string): Promise<Bid> {
+    const bid = await this.findOne(id);
+    const job = await this.jobsService.findOne(bid.jobId);
+
+    if (
+      role === 'ADMIN' ||
+      role === 'SUPER_ADMIN' ||
+      bid.artisanId === userId ||
+      job?.clientId === userId
+    ) {
+      return bid;
+    }
+
+    throw new ForbiddenException('You do not have permission to view this bid');
   }
 
   // ─────────────────────────────────────────────────────────────────────
@@ -126,6 +173,15 @@ export class BidsService {
 
     if (bid.status !== BidStatus.PENDING) {
       throw new BadRequestException(`Cannot accept a bid with status: ${bid.status}`);
+    }
+
+    const acceptTotalKobo = toMinorUnits(bid.amount);
+    const acceptT1Kobo = toMinorUnits(bid.tranche1Amount);
+    const acceptT2Kobo = toMinorUnits(bid.tranche2Amount);
+    if (acceptT1Kobo + acceptT2Kobo !== acceptTotalKobo || !isTranche1Compliant(acceptT1Kobo, acceptTotalKobo)) {
+      throw new BadRequestException(
+        `This bid cannot be accepted because its tranche split violates the Safe-Lock policy. ${tranche1PolicyMessage()}`,
+      );
     }
 
     const job = await this.jobsService.findOne(bid.jobId);
@@ -163,7 +219,7 @@ export class BidsService {
       job.tranche2Amount = bid.tranche2Amount;
       await manager.save(job);
 
-      // 4. Create the escrow — this will also enforce the one-escrow-per-job rule
+      // 4. Create the escrow — passing transaction manager to guarantee atomic visibility
       const escrow = await this.escrowService.create(
         {
           jobId: job.id,
@@ -172,7 +228,7 @@ export class BidsService {
           tranche2Amount: Number(bid.tranche2Amount),
         },
         clientId,
-        manager, // same transaction: the job update above is not committed yet
+        manager,
       );
 
       return {

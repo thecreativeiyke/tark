@@ -289,7 +289,15 @@ export class SupportService {
 
     if (targetJobId) {
       const job = await this.jobsRepository.findOneBy({ id: targetJobId });
-      if (job) {
+      // SECURITY (H-12): Prevent BOLA/IDOR — only load context if caller is a party to the job or Admin
+      const isParty =
+        job &&
+        (job.clientId === user.id ||
+          job.artisanId === user.id ||
+          user.role === UserRole.ADMIN ||
+          user.role === UserRole.SUPER_ADMIN);
+
+      if (job && isParty) {
         let otherPartyName: string | undefined;
         const otherPartyId = user.id === job.clientId ? job.artisanId : job.clientId;
         if (otherPartyId) {

@@ -48,7 +48,7 @@ export class EscrowTransaction {
   @Column({ type: 'decimal', precision: 10, scale: 2 })
   tranche2Amount: number;
 
-  // Platform service fee — deducted from artisan payout
+  // Platform service fee — deducted from the artisan's final payout
   @Column({ type: 'decimal', precision: 10, scale: 2, default: 0 })
   platformFeeAmount: number;
 
@@ -73,6 +73,8 @@ export class EscrowTransaction {
   })
   totalStatus: EscrowStatus;
 
+  // Looked up on every payment webhook, so it must be indexed.
+  @Index()
   @Column({ nullable: true })
   paystackReference: string;
 
@@ -93,9 +95,17 @@ export class EscrowTransaction {
   @Column({ type: 'timestamp', nullable: true })
   handshakeExpiresAt: Date | null;
 
-  // Tracks failed PIN attempts — locks out after MAX_PIN_ATTEMPTS
+  // Tracks failed PIN attempts for the CURRENT pin — resets when a new pin is issued
   @Column({ default: 0 })
   handshakePinAttempts: number;
+
+  // Number of brute-force lockouts (5 wrong PINs) on this escrow. Expiry does NOT count.
+  @Column({ default: 0 })
+  handshakeCycles: number;
+
+  // While in the future, a new handshake cannot be started (exponential cooldown, capped at 24h)
+  @Column({ type: 'timestamptz', nullable: true })
+  handshakeLockedUntil: Date | null;
 
   @CreateDateColumn()
   createdAt: Date;
