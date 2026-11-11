@@ -219,6 +219,9 @@ async function runActiveHacking() {
     },
   );
   console.log(`   Initiate Handshake: ${initHandshake.status} ("${initHandshake.data.message?.slice(0, 40)}...")`);
+  if (initHandshake.status !== 200) {
+    throw new Error(`Setup failed: initiate-handshake returned ${initHandshake.status} ${JSON.stringify(initHandshake.data)} (check the proof URL host matches STORAGE_CUSTOM_CDN_URL)`);
+  }
 
   // Exhaust 5 attempts
   console.log('   Simulating 5 consecutive wrong PIN guesses...');
@@ -267,7 +270,7 @@ async function runActiveHacking() {
   );
   console.log(`   Bypass Response Code: ${bypassAttempt.status}`);
   console.log(`   Bypass Message: "${bypassAttempt.data.message}"`);
-  if (bypassAttempt.status === 200) {
+  if (bypassAttempt.status === 200 || !String(bypassAttempt.data?.message).toLowerCase().includes('locked out')) {
     throw new Error('Exploit C-2 Succeeded! Handshake was allowed to restart immediately after lockout.');
   }
   console.log('   🛡️ SEALED: Immediate handshake restart blocked by exponential cooldown.');
@@ -336,6 +339,15 @@ async function runActiveHacking() {
     throw new Error(`Exploit C-1 Succeeded! Wallet balance was credited twice: NGN ${finalBalance}`);
   }
   console.log('   🛡️ SEALED: Webhook replay successfully deduplicated. Wallet credited exactly once!');
+
+  // CLEANUP: remove every row this run created so the shared DB stays clean
+  const ids = [artisanId, decodeJwt(clientToken).sub];
+  await pgClient.query(`DELETE FROM wallet_ledgers WHERE "userId"::text = ANY($1::text[])`, [ids]);
+  await pgClient.query(`DELETE FROM notifications WHERE "userId"::text = ANY($1::text[])`, [ids]);
+  await pgClient.query(`DELETE FROM escrow_transaction WHERE "jobId"::text = $1`, [jobId]);
+  await pgClient.query(`DELETE FROM bid WHERE "jobId"::text = $1`, [jobId]);
+  await pgClient.query(`DELETE FROM job WHERE id::text = $1`, [jobId]);
+  await pgClient.query(`DELETE FROM "user" WHERE id::text = ANY($1::text[])`, [ids]);
 
   await pgClient.end();
   console.log('\n================================================================');

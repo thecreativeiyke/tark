@@ -196,6 +196,7 @@ export class EscrowService {
     escrow.handshakeExpiresAt = null;
     escrow.handshakePinAttempts = 0;
     escrow.tranche2TransferRef = transfer.reference ?? null;
+    escrow.feeCollectedMinor = Math.min(feeMinor, grossFinalMinor);
 
     await manager.update(Job, escrow.jobId, { status: JobStatus.COMPLETED });
     return manager.save(EscrowTransaction, escrow);
@@ -330,23 +331,38 @@ export class EscrowService {
   // LOCK FUNDS — called only by the payment webhook / wallet funding,
   // never a public route.
   // ─────────────────────────────────────────────────────────────────────
-  async lockFunds(id: string) {
-    const saved = await this.dataSource.transaction(async (manager) => {
-      const escrow = await this.lockEscrow(manager, id);
+  // Lock funds inside a caller-owned transaction (wallet funding). Takes the escrow row
+  // lock, re-checks the status under it, and records which channel paid.
+  async lockFundsInTransaction(
+    manager: EntityManager,
+    id: string,
+    via: 'WALLET' | 'ONLINE' = 'ONLINE',
+  ): Promise<EscrowTransaction> {
+    const escrow = await this.lockEscrow(manager, id);
 
-      if (escrow.totalStatus !== EscrowStatus.INITIATED) {
-        throw new BadRequestException('Funds can only be locked from INITIATED status');
-      }
+    if (escrow.totalStatus !== EscrowStatus.INITIATED) {
+      throw new BadRequestException('Funds can only be locked from INITIATED status');
+    }
 
-      escrow.totalStatus = EscrowStatus.FUNDS_LOCKED;
-      escrow.tranche1Status = TrancheStatus.LOCKED;
-      escrow.tranche2Status = TrancheStatus.LOCKED;
+    escrow.totalStatus = EscrowStatus.FUNDS_LOCKED;
+    escrow.tranche1Status = TrancheStatus.LOCKED;
+    escrow.tranche2Status = TrancheStatus.LOCKED;
+    escrow.fundedVia = via;
 
-      await manager.update(Job, escrow.jobId, { status: JobStatus.IN_PROGRESS });
-      return manager.save(EscrowTransaction, escrow);
-    });
+    await manager.update(Job, escrow.jobId, { status: JobStatus.IN_PROGRESS });
+    return manager.save(EscrowTransaction, escrow);
+  }
 
-    // Notify artisan that escrow is funded and ready
+  async lockFunds(id: string, via: 'WALLET' | 'ONLINE' = 'ONLINE') {
+    const saved = await this.dataSource.transaction((manager) =>
+      this.lockFundsInTransaction(manager, id, via),
+    );
+    this.notifyFunded(saved);
+    return saved;
+  }
+
+  // Notify artisan that escrow is funded and ready. Call AFTER the funding transaction commits.
+  notifyFunded(saved: EscrowTransaction) {
     this.dataSource
       .getRepository(Job)
       .findOne({ where: { id: saved.jobId } })
@@ -369,8 +385,6 @@ export class EscrowService {
         });
       })
       .catch((err) => this.logger.error(`Failed to dispatch Safe-Lock funded alert: ${err.message}`));
-
-    return saved;
   }
 
   // ─────────────────────────────────────────────────────────────────────

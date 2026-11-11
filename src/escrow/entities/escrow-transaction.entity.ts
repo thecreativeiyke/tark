@@ -85,6 +85,15 @@ export class EscrowTransaction {
   @Column({ type: 'varchar', nullable: true })
   tranche2TransferRef: string | null;
 
+  // Which channel funded the escrow ('WALLET' | 'ONLINE'). A later online payment on a
+  // wallet-funded escrow is a duplicate and gets credited back to the client's wallet.
+  @Column({ type: 'varchar', length: 16, nullable: true })
+  fundedVia: string | null;
+
+  // Platform fee actually retained at settlement, in kobo
+  @Column({ type: 'integer', default: 0 })
+  feeCollectedMinor: number;
+
   @Column('text', { array: true, nullable: true })
   proofOfWorkUrls: string[];
 

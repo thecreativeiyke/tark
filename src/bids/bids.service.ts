@@ -13,7 +13,7 @@ import { JobsService } from '../jobs/jobs.service';
 import { JobStatus } from '../jobs/entities/job.entity';
 import { EscrowService } from '../escrow/escrow.service';
 import { NotificationsService } from '../notifications/notifications.service';
-import { User } from '../users/entities/user.entity';
+import { User, UserRole } from '../users/entities/user.entity';
 
 @Injectable()
 export class BidsService {
@@ -126,7 +126,7 @@ export class BidsService {
       throw new NotFoundException(`Job #${jobId} not found`);
     }
 
-    if (role === 'ADMIN' || role === 'SUPER_ADMIN' || job.clientId === userId) {
+    if (role === UserRole.ADMIN || role === UserRole.SUPER_ADMIN || job.clientId === userId) {
       return this.bidsRepository.find({
         where: { jobId },
         order: { createdAt: 'DESC' },
@@ -152,8 +152,8 @@ export class BidsService {
     const job = await this.jobsService.findOne(bid.jobId);
 
     if (
-      role === 'ADMIN' ||
-      role === 'SUPER_ADMIN' ||
+      role === UserRole.ADMIN ||
+      role === UserRole.SUPER_ADMIN ||
       bid.artisanId === userId ||
       job?.clientId === userId
     ) {

@@ -173,19 +173,29 @@ async function main() {
     throw new Error(`EXPLOIT H-3 SUCCEEDED! GET /bids/job/:id without auth returned ${anonBidRes.status} instead of 401!`);
   }
 
-  // Try as outsider (another client)
+  // A real bid must exist, otherwise "empty list" proves nothing
+  const bidRes = await POST('/bids', {
+    jobId, amount: 50000, tranche1Amount: 20000, tranche2Amount: 30000, coverNote: 'rt2 bid',
+  }, artisan_token);
+  if (bidRes.status !== 201) throw new Error('Setup failed: could not place bid: ' + JSON.stringify(bidRes.data));
+  const bidId = bidRes.data.id;
+
   const outsiderBidRes = await GET(`/bids/job/${jobId}`, outsider_token);
-  if (outsiderBidRes.status !== 200) {
-    // OK — might be 200 with empty array (outsider sees nothing)
-    // But if status is 403, that's also acceptable
-    if (outsiderBidRes.status !== 403) {
-      console.log(`   Outsider bid response: ${outsiderBidRes.status} → ${JSON.stringify(outsiderBidRes.data).slice(0, 100)}`);
-    }
-  } else {
-    // outsider got 200 — they should see EMPTY array (not client A's bids)
-    if (Array.isArray(outsiderBidRes.data) && outsiderBidRes.data.length > 0) {
-      throw new Error('EXPLOIT H-3 SUCCEEDED! Outsider can see bids on a job they do not own!');
-    }
+  const ownerBidRes = await GET(`/bids/job/${jobId}`, clientA_token);
+  const artisanBidRes = await GET(`/bids/job/${jobId}`, artisan_token);
+  const outsiderSingleBid = await GET(`/bids/${bidId}`, outsider_token);
+
+  if (!Array.isArray(ownerBidRes.data) || ownerBidRes.data.length !== 1) {
+    throw new Error('REGRESSION H-3: job owner cannot see the bid on their own job!');
+  }
+  if (!Array.isArray(artisanBidRes.data) || artisanBidRes.data.length !== 1) {
+    throw new Error('REGRESSION H-3: bidding artisan cannot see their own bid!');
+  }
+  if (outsiderBidRes.status === 200 && Array.isArray(outsiderBidRes.data) && outsiderBidRes.data.length > 0) {
+    throw new Error('EXPLOIT H-3 SUCCEEDED! Outsider can see bids on a job they do not own!');
+  }
+  if (outsiderSingleBid.status !== 403) {
+    throw new Error(`EXPLOIT H-3 SUCCEEDED! GET /bids/:id by outsider returned ${outsiderSingleBid.status} instead of 403!`);
   }
 
   console.log(`   Anonymous → GET /bids/job/:id → ${anonBidRes.status} (must be 401) ✓`);

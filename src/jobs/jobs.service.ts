@@ -11,6 +11,7 @@ import { CreateJobDto } from './dto/create-job.dto';
 import { UpdateJobDto } from './dto/update-job.dto';
 import { QueryJobDto } from './dto/query-job.dto';
 import { CategoriesService } from '../categories/categories.service';
+import { UserRole } from '../users/entities/user.entity';
 
 @Injectable()
 export class JobsService {
@@ -54,8 +55,10 @@ export class JobsService {
     }
 
     if (search && search.trim().length > 0) {
+      // Location is deliberately NOT searchable here: a LIKE on the private address lets
+      // anonymous callers probe for exact streets one guess at a time.
       qb.andWhere(
-        '(LOWER(job.title) LIKE LOWER(:search) OR LOWER(job.description) LIKE LOWER(:search) OR LOWER(job.location) LIKE LOWER(:search))',
+        '(LOWER(job.title) LIKE LOWER(:search) OR LOWER(job.description) LIKE LOWER(:search))',
         { search: `%${search.trim()}%` },
       );
     }
@@ -87,7 +90,7 @@ export class JobsService {
    */
   coarsenJob(job: Job, caller?: { userId?: string; role?: string }) {
     const isOwner = Boolean(caller?.userId && caller.userId === job.clientId);
-    const isAdmin = caller?.role === 'ADMIN' || caller?.role === 'SUPER_ADMIN';
+    const isAdmin = caller?.role === UserRole.ADMIN || caller?.role === UserRole.SUPER_ADMIN;
     const isAssignedAndActive = Boolean(
       caller?.userId &&
       caller.userId === job.artisanId &&
@@ -98,10 +101,13 @@ export class JobsService {
       return job;
     }
 
-    let coarseLocation = job.location;
-    if (coarseLocation && coarseLocation.includes(',')) {
-      const parts = coarseLocation.split(',').map((p) => p.trim());
-      coarseLocation = parts.slice(-2).join(', ');
+    // Fail closed: keep only the area. With 3+ comma segments (street, area, city) keep the
+    // last two; with 2 (street, area) keep only the last; with no comma we cannot tell a street
+    // from an area, so hide it entirely. A structured public area field would be better still.
+    let coarseLocation = 'Exact location shared after assignment';
+    if (job.location && job.location.includes(',')) {
+      const parts = job.location.split(',').map((p) => p.trim()).filter(Boolean);
+      coarseLocation = parts.length >= 3 ? parts.slice(-2).join(', ') : parts[parts.length - 1];
     }
 
     return {

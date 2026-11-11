@@ -15,6 +15,8 @@ import {
   ResolveAccountResult,
   TransferPayoutParams,
   TransferPayoutResult,
+  TransferDispatchError,
+  VerifyTransferResult,
 } from '../interfaces/payment-gateway.interface';
 
 @Injectable()
@@ -75,6 +77,11 @@ export class PaystackGateway implements IPaymentGateway {
         rawResponse: response.data.data,
       };
     } catch (error: any) {
+      if (!this.sandboxFallbackAllowed()) {
+        // Never hand a customer a dead "sandbox" checkout link in production.
+        this.logger.error(`Paystack initialization failed: ${error?.response?.data?.message || error?.message}`);
+        throw new BadGatewayException('Could not start the payment right now. Please try again shortly.');
+      }
       this.logger.warn('Paystack live initialization unavailable (' + (error?.code || error?.message) + '). Activating Sandbox checkout.');
       return {
         authorizationUrl: `https://checkout.paystack.com/sandbox-${reference}`,
@@ -156,14 +163,26 @@ export class PaystackGateway implements IPaymentGateway {
           reason: params.reason,
           ...(params.reference ? { reference: params.reference } : {}),
         },
-        { headers: this.getHeaders() },
+        { headers: this.getHeaders(), timeout: 20000 },
       );
     } catch (error: any) {
+      const httpStatus: number | undefined = error?.response?.status;
       const detail = error?.response?.data?.message || error.message;
       if (!this.sandboxFallbackAllowed()) {
-        // Never pretend money moved. The caller must treat this as a failed payout.
-        this.logger.error(`Paystack transfer failed: ${detail}`);
-        throw new BadGatewayException(`Payout failed with the payment provider: ${detail}`);
+        // Never pretend money moved. A 4xx (except 408/429) is a definitive refusal, so no
+        // transfer exists. Anything else (timeout, 5xx, network) is ambiguous: the transfer
+        // may exist, and the caller must verify before ever retrying.
+        this.logger.error(`Paystack transfer failed (${httpStatus ?? 'no response'}): ${detail}`);
+        const definitive =
+          httpStatus !== undefined &&
+          httpStatus >= 400 &&
+          httpStatus < 500 &&
+          httpStatus !== 408 &&
+          httpStatus !== 429;
+        throw new TransferDispatchError(
+          `Payout failed with the payment provider: ${detail}`,
+          definitive ? 'REJECTED' : 'UNKNOWN',
+        );
       }
       this.logger.warn(`Paystack transfer fallback in sandbox mode: ${detail}`);
       return {
@@ -173,20 +192,37 @@ export class PaystackGateway implements IPaymentGateway {
     }
 
     const data = response.data?.data ?? {};
-    const status: string = data.status || 'success';
-    // 'otp' means the transfer is waiting for manual approval and has NOT been sent.
-    if (['otp', 'failed', 'reversed'].includes(status)) {
-      this.logger.error(`Paystack transfer not completed (status: ${status})`);
-      throw new BadGatewayException(
-        `Payout was not accepted by the payment provider (status: ${status})`,
-      );
-    }
-
+    // The provider status is returned as-is (success | pending | received | otp | failed |
+    // reversed). Interpreting it is the payout service's job, because 'pending' is not paid
+    // yet and 'otp' means the transfer exists but has NOT been sent.
     return {
-      status,
-      reference: data.reference,
+      status: data.status || 'pending',
+      reference: data.reference ?? params.reference,
       rawResponse: data,
     };
+  }
+
+  async verifyTransfer(reference: string): Promise<VerifyTransferResult> {
+    try {
+      const response = await axios.get(
+        `${this.baseUrl}/transfer/verify/${encodeURIComponent(reference)}`,
+        { headers: this.getHeaders(), timeout: 20000 },
+      );
+      const data = response.data?.data ?? {};
+      return {
+        found: true,
+        status: data.status,
+        reference: data.reference ?? reference,
+        amountMinor: Number(data.amount),
+      };
+    } catch (error: any) {
+      const httpStatus = error?.response?.status;
+      const message = String(error?.response?.data?.message || '');
+      if (httpStatus === 404 || (httpStatus === 400 && /not found/i.test(message))) {
+        return { found: false };
+      }
+      throw error;
+    }
   }
 
   verifyWebhook(rawBody: Buffer, signature: string): boolean {

@@ -29,7 +29,7 @@
 
 ## 🗓️ Session Log
 
-### 🗓️ 2026-11-11 — Session 11: Red-Team Active Penetration Hardening (Phases 1 & 2) — 100% Repelled
+### 🗓️ 2026-11-11 — Session 11: Red-Team Active Penetration Hardening (Phases 1, 2 & 3) — 100% Repelled
 - **Author**: Lead Engineers: Claude (Principal Adversary Audit & Cross-Check) & Antigravity / Gemini (Defense Architecture, Active Exploitation & Live Verification)
 - **Tag**: `[FLAGGED & FIXED]` & `[AUDIT]` & `[SHIPPED]` — Full rationale in [ADR 009](./docs/adr/009-security-hardening-phase1-phase2.md)
 
@@ -37,6 +37,7 @@
 1. **Webhook Replay Double-Spend (C-1, P-2)**:
    - Created `wallet_ledgers` table with a `UNIQUE` constraint on `reference`.
    - `PaymentsService.handleWebhook` now acquires `pessimistic_write` row lock on `User`, writes ledger records, validates positive safe integer amounts (`amountMinor`), and safely deduplicates retries (code `23505`).
+   - Overpayments or late online payments on wallet-funded escrows are credited to the client's wallet with idempotent ledger references (`overpay-${ref}`, `unmatched-${ref}`) rather than dropped.
 2. **Handshake PIN Brute-Force & Reset Lockout Loop (C-2, P-1)**:
    - Added `handshakeCycles` and `handshakeLockedUntil` columns to `EscrowTransaction`.
    - Differentiated reset logic: honest 15-min PIN expiry resets without penalty, while 5 consecutive incorrect guesses trigger exponential backoff cooldown ($15 \times 2^{n-1}$ minutes, capped at 24 hours).
@@ -45,15 +46,22 @@
    - Built centralized `src/escrow/escrow-policy.ts` using integer kobo conversion (`toMinorUnits`).
    - Enforces 30%–50% Start-Work Mobilization (Tranche 1) and exact kobo balance ($T_1 + T_2 = \text{Total}$).
    - `BidsService.acceptBid` re-validates tranche rules at acceptance time to block legacy uncompliant bids.
-4. **Wallet Debit Auditability (P-6)**:
-   - `PaymentsService.fundEscrowWithWallet` writes a `WalletLedger` DEBIT row within the deduction transaction.
+4. **Atomic Wallet Funding & Fee Recording (H-8, P-4, P-6)**:
+   - `PaymentsService.fundEscrowWithWallet` executes inside a single transaction locking `EscrowTransaction` first, re-verifying `INITIATED` status, locking `User`, debiting balance, and writing `wdebit-${escrowId}` to `WalletLedger`.
+   - Records `feeCollectedMinor` in minor units upon final settlement.
    - Added PostgreSQL `wallet_sane` CHECK constraint on `"user"` table ensuring non-negative, non-NaN balance.
 5. **PII, IDOR & Access Control Shields (H-1, H-2, H-3, H-4, H-12)**:
    - **Artisan Privacy (H-1)**: `GET /users/artisans/nearby` now authenticated (`JwtAuthGuard`), throttled, filters out uncertified artisans, and strips email, phone, and exact GPS coordinates.
-   - **Job Location Coarsening (H-2)**: `GET /jobs` and `GET /jobs/:id` with `OptionalJwtAuthGuard` redact address to city/state and nullify GPS coordinates for anonymous users and non-owners.
+   - **Job Location Coarsening (H-2)**: `GET /jobs` and `GET /jobs/:id` with `OptionalJwtAuthGuard` redact address to city/state and nullify GPS coordinates for anonymous users and non-owners. Free-text search on private addresses disabled.
    - **Bid Access Scoping (H-3)**: `GET /bids/job/:jobId` and `GET /bids/:id` now require JWT auth and enforce strict ownership boundaries.
    - **Password Hash Redaction (H-4)**: `User.password` marked `@Column({ select: false })` — hash never leaks in `/auth/me` or relation queries.
    - **Support AI BOLA Defense (H-12)**: `SupportService.buildUserContext` verifies caller is a party to the referenced job/escrow before feeding job data into AI context.
+6. **Dispute Arbitration Hardening (H-9)**:
+   - Platform service fee is strictly subtracted in integer kobo before distributing settlement funds across all verdicts (`FULL_REFUND`, `FULL_PAYOUT`, `SPLIT_SETTLEMENT`).
+   - Client refunds generate a unique `dispute-refund-${dispute.id}` audit row in `WalletLedger`.
+7. **Production Sandbox Guard & Payout Profile Whitelisting**:
+   - DVA generation and sandbox checkout URLs strictly throw 502 in production unless `PAYMENTS_SANDBOX_FALLBACK=true` in dev.
+   - Stripped payout fields from `UpdateProfileDto` to mandate verified account resolution via `/payments/bank/save`.
 
 #### 🧪 Live Verification — ALL ATTACKS 100% REPELLED ✅:
 - **Phase 1 Active Exploit Suite (`scripts/redteam-active-hack-phase1.js`)**: 5 attacks (100% upfront bid, skewed split, decimal slop, PIN lockout bypass, webhook replay) → **100% Repelled**.

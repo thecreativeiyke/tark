@@ -35,6 +35,26 @@ export interface TransferPayoutResult {
   rawResponse?: any;
 }
 
+// Thrown by a gateway when a transfer request did not come back with a usable answer.
+//  REJECTED: the provider answered with a definitive error, so NO transfer was created.
+//  UNKNOWN:  timeout / 5xx / network failure, so a transfer MAY have been created.
+export class TransferDispatchError extends Error {
+  constructor(
+    message: string,
+    public readonly outcome: 'REJECTED' | 'UNKNOWN',
+  ) {
+    super(message);
+    this.name = 'TransferDispatchError';
+  }
+}
+
+export interface VerifyTransferResult {
+  found: boolean;
+  status?: string;
+  reference?: string;
+  amountMinor?: number;
+}
+
 export interface IPaymentGateway {
   readonly providerName: string;
   supportsCurrency(currency: string): boolean;
@@ -42,6 +62,8 @@ export interface IPaymentGateway {
   resolveAccount?(accountNumber: string, routingCode: string): Promise<ResolveAccountResult>;
   createRecipient(name: string, identifier: string, routingCode?: string, currency?: string): Promise<string>;
   initiateTransfer(params: TransferPayoutParams): Promise<TransferPayoutResult>;
+  // Looks a transfer up by our reference. Needed to retry payouts safely (never pay twice).
+  verifyTransfer?(reference: string): Promise<VerifyTransferResult>;
   verifyWebhook(rawBody: Buffer, signature: string): boolean;
   handleWebhookEvent(event: any): Promise<any>;
 }

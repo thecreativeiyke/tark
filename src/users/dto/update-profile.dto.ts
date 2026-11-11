@@ -31,16 +31,6 @@ export class UpdateProfileDto {
   @IsString()
   idNumber?: string;
 
-  // Payout Configuration
-  @IsOptional()
-  @IsString()
-  payoutProvider?: string;
-
-  @IsOptional()
-  @IsString()
-  payoutAccountIdentifier?: string;
-
-  @IsOptional()
-  @IsString()
-  payoutBankOrNetwork?: string;
+  // Payout details are NOT editable here: they must go through POST /payments/bank/save,
+  // which resolves the account with the provider and creates the transfer recipient.
 }

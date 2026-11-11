@@ -1,6 +1,7 @@
 import {
   Injectable,
   BadRequestException,
+  BadGatewayException,
   ForbiddenException,
   InternalServerErrorException,
   NotFoundException,
@@ -13,7 +14,7 @@ import { InjectRepository, InjectDataSource } from '@nestjs/typeorm';
 import { Repository, DataSource } from 'typeorm';
 import axios from 'axios';
 import { EscrowService } from '../escrow/escrow.service';
-import { EscrowStatus } from '../escrow/entities/escrow-transaction.entity';
+import { EscrowStatus, EscrowTransaction } from '../escrow/entities/escrow-transaction.entity';
 import { User } from '../users/entities/user.entity';
 import { Job } from '../jobs/entities/job.entity';
 import { WalletLedger, WalletLedgerType } from './entities/wallet-ledger.entity';
@@ -278,43 +279,55 @@ export class PaymentsService {
   // Two simultaneous requests cannot both pass the balance check.
   // ─────────────────────────────────────────────────────────────────────
   async fundEscrowWithWallet(escrowId: string, userId: string) {
-    // Validate the escrow first (outside the transaction — read-only, safe)
-    const escrow = await this.escrowService.findOne(escrowId);
-
-    if (escrow.clientId !== userId) {
-      throw new BadRequestException('Only the client who created this escrow can fund it');
-    }
-
-    if (escrow.totalStatus !== EscrowStatus.INITIATED) {
-      throw new BadRequestException(`Escrow is already in status: ${escrow.totalStatus}`);
-    }
-
-    const totalAmount = Number(escrow.tranche1Amount) + Number(escrow.tranche2Amount);
-
-    // Run the balance check + deduction inside a transaction with a row lock
-    // This means only one request at a time can touch this user's wallet row
+    // Everything happens in ONE transaction: lock the escrow row first, re-check its
+    // status under the lock, then debit the wallet, write the ledger row and lock the
+    // escrow funds. Either all of it commits or none of it does, and two concurrent
+    // requests (or a request racing the Paystack webhook) cannot both pay.
+    // Lock order is always escrow -> user, matching the dispute resolver.
     const result = await this.dataSource.transaction(async (manager) => {
+      const escrow = await manager.findOne(EscrowTransaction, {
+        where: { id: escrowId },
+        lock: { mode: 'pessimistic_write' },
+      });
+      if (!escrow) {
+        throw new NotFoundException('Escrow transaction not found');
+      }
+      if (escrow.clientId !== userId) {
+        throw new BadRequestException('Only the client who created this escrow can fund it');
+      }
+      if (escrow.totalStatus !== EscrowStatus.INITIATED) {
+        throw new BadRequestException(`Escrow is already in status: ${escrow.totalStatus}`);
+      }
+      if ((escrow.currency || 'NGN').toUpperCase() !== 'NGN') {
+        throw new BadRequestException('Wallet funding supports NGN escrows only');
+      }
+
+      // Integer kobo arithmetic, no floating-point drift
+      const totalMinor = Math.round((Number(escrow.tranche1Amount) + Number(escrow.tranche2Amount)) * 100);
+      const totalAmount = totalMinor / 100;
+
       const user = await manager.findOne(User, {
         where: { id: userId },
         lock: { mode: 'pessimistic_write' }, // SELECT FOR UPDATE
       });
-
       if (!user) {
         throw new NotFoundException('User not found');
       }
 
-      const currentBalance = Number(user.walletBalance || 0);
-      if (currentBalance < totalAmount) {
+      const currentMinor = Math.round(Number(user.walletBalance || 0) * 100);
+      if (currentMinor < totalMinor) {
         throw new BadRequestException(
-          `Insufficient wallet balance. Required: NGN ${totalAmount.toFixed(2)}, Available: NGN ${currentBalance.toFixed(2)}`,
+          `Insufficient wallet balance. Required: NGN ${totalAmount.toFixed(2)}, Available: NGN ${(currentMinor / 100).toFixed(2)}`,
         );
       }
 
-      user.walletBalance = parseFloat((currentBalance - totalAmount).toFixed(2));
-      await manager.save(user);
+      user.walletBalance = (currentMinor - totalMinor) / 100;
+      await manager.save(User, user);
 
+      // Deterministic reference: the UNIQUE constraint on wallet_ledgers.reference is a
+      // second line of defence against a double debit for the same escrow.
       const debitLedger = manager.create(WalletLedger, {
-        reference: `wdebit-${escrow.id}-${Date.now()}`,
+        reference: `wdebit-${escrow.id}`,
         userId: user.id,
         amount: totalAmount,
         type: WalletLedgerType.DEBIT,
@@ -322,17 +335,19 @@ export class PaymentsService {
       });
       await manager.save(WalletLedger, debitLedger);
 
-      return { remainingBalance: user.walletBalance };
+      const lockedEscrow = await this.escrowService.lockFundsInTransaction(manager, escrow.id, 'WALLET');
+
+      return { totalAmount, remainingBalance: user.walletBalance, lockedEscrow };
     });
 
-    // Lock the escrow funds (outside the transaction — this is a separate operation)
-    const lockedEscrow = await this.escrowService.lockFunds(escrow.id);
+    // Notify only after the transaction has committed
+    this.escrowService.notifyFunded(result.lockedEscrow);
 
     return {
       message: 'Escrow funded successfully from wallet',
-      deductedAmount: totalAmount,
+      deductedAmount: result.totalAmount,
       remainingBalance: result.remainingBalance,
-      escrow: lockedEscrow,
+      escrow: result.lockedEscrow,
     };
   }
 
@@ -435,6 +450,12 @@ export class PaymentsService {
         await this.usersRepository.save(user);
       } catch (err: any) {
         this.logger.error('Failed to create customer on provider', err?.response?.data || err.message);
+        // Never persist a made-up customer code outside sandbox mode.
+        if (!this.sandboxFallbackAllowed()) {
+          throw new BadGatewayException(
+            'Could not set up your funding account right now. Please try again shortly.',
+          );
+        }
         customerCode = `CUS_${Date.now()}`;
         user.paystackCustomerCode = customerCode;
         await this.usersRepository.save(user);
@@ -456,6 +477,14 @@ export class PaymentsService {
       user.virtualBankName = dvaData.bank.name;
       await this.usersRepository.save(user);
     } catch (error: any) {
+      // A fake account number could receive REAL money from a real bank customer.
+      // Only ever simulate one in non-production sandbox mode.
+      if (!this.sandboxFallbackAllowed()) {
+        this.logger.error(`DVA provisioning failed: ${error?.response?.data?.message || error.message}`);
+        throw new BadGatewayException(
+          'Could not create your dedicated funding account right now. Please try again shortly.',
+        );
+      }
       this.logger.warn(`DVA live provision unavailable. Activating Sandbox DVA.`);
       user.virtualAccountNumber = `96${Math.floor(10000000 + Math.random() * 90000000)}`;
       user.virtualBankName = 'Paystack-Titan (Sandbox)';
@@ -486,6 +515,89 @@ export class PaymentsService {
     });
   }
 
+  // An online payment arrived for an escrow that is already funded. If the wallet funded
+  // it, the client has now paid twice: credit the online payment back to their wallet.
+  // Any other case is an idempotent replay of the payment that funded it.
+  private async handleAlreadyFundedEscrow(
+    escrow: EscrowTransaction,
+    reference: string,
+    amountMinor: number,
+    currency?: string,
+  ) {
+    if (escrow.fundedVia === 'WALLET' && (currency || 'NGN').toUpperCase() === 'NGN') {
+      const credited = await this.creditWalletOnce(
+        escrow.clientId,
+        `overpay-${reference}`,
+        amountMinor,
+        `Paystack payment ${reference} received after escrow was already funded from wallet`,
+      );
+      return {
+        status: 'success',
+        message: credited
+          ? 'Escrow already funded from wallet; online payment credited to client wallet'
+          : 'Duplicate payment already credited (idempotent)',
+      };
+    }
+    return { status: 'success', message: 'Escrow already funded (idempotent)' };
+  }
+
+  // Credits a user's wallet exactly once per ledgerRef (UNIQUE constraint + existence check).
+  // Returns true when it credited, false when it had already been credited.
+  private async creditWalletOnce(
+    userId: string,
+    ledgerRef: string,
+    amountMinor: number,
+    description: string,
+  ): Promise<boolean> {
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+    try {
+      const existing = await queryRunner.manager.findOne(WalletLedger, {
+        where: { reference: ledgerRef },
+      });
+      if (existing) {
+        await queryRunner.rollbackTransaction();
+        return false;
+      }
+
+      const user = await queryRunner.manager.findOne(User, {
+        where: { id: userId },
+        lock: { mode: 'pessimistic_write' },
+      });
+      if (!user) {
+        await queryRunner.rollbackTransaction();
+        this.logger.error(`Cannot credit ${ledgerRef}: user ${userId} not found`);
+        return false;
+      }
+
+      const amountMajor = amountMinor / 100;
+      await queryRunner.manager.save(
+        WalletLedger,
+        queryRunner.manager.create(WalletLedger, {
+          reference: ledgerRef,
+          userId: user.id,
+          amount: amountMajor,
+          type: WalletLedgerType.CREDIT,
+          description,
+        }),
+      );
+      user.walletBalance = (Math.round(Number(user.walletBalance || 0) * 100) + amountMinor) / 100;
+      await queryRunner.manager.save(User, user);
+
+      await queryRunner.commitTransaction();
+      return true;
+    } catch (err: any) {
+      await queryRunner.rollbackTransaction();
+      if (err.code === '23505') {
+        return false;
+      }
+      throw err;
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
   verifyWebhookSignature(rawBody: Buffer, signature: string, provider = 'paystack'): boolean {
     const gateway = this.gatewayResolver.resolveByProvider(provider);
     return gateway.verifyWebhook(rawBody, signature);
@@ -507,20 +619,11 @@ export class PaymentsService {
       // 1. Escrow direct checkout path
       const escrow = await this.escrowService.findByReference(reference);
       if (escrow) {
-        if (
-          escrow.totalStatus === EscrowStatus.FUNDS_LOCKED ||
-          escrow.totalStatus === EscrowStatus.HANDSHAKE_PENDING ||
-          escrow.totalStatus === EscrowStatus.SETTLED
-        ) {
-          return { status: 'success', message: 'Escrow already funded (idempotent)' };
-        }
-
-        const expectedMinor = Math.round((Number(escrow.tranche1Amount) + Number(escrow.tranche2Amount)) * 100);
-        if (amountMinor !== expectedMinor) {
-          this.logger.error(
-            `Escrow funding amount mismatch for ref ${reference}. Expected ${expectedMinor} kobo, received ${amountMinor} kobo.`,
-          );
-          return { status: 'ignored', message: 'Charge amount does not match escrow total' };
+        // Anything past INITIATED means the escrow is already funded (locked, tranche 1
+        // released, handshake, disputed or settled). If it was funded from the wallet,
+        // this online payment is a duplicate and must be credited back, not swallowed.
+        if (escrow.totalStatus !== EscrowStatus.INITIATED) {
+          return this.handleAlreadyFundedEscrow(escrow, reference, amountMinor, d.currency);
         }
 
         if (d.currency && escrow.currency && d.currency.toUpperCase() !== escrow.currency.toUpperCase()) {
@@ -530,7 +633,43 @@ export class PaymentsService {
           return { status: 'ignored', message: 'Currency mismatch' };
         }
 
-        await this.escrowService.lockFunds(escrow.id);
+        const expectedMinor = Math.round((Number(escrow.tranche1Amount) + Number(escrow.tranche2Amount)) * 100);
+        if (amountMinor !== expectedMinor) {
+          this.logger.error(
+            `Escrow funding amount mismatch for ref ${reference}. Expected ${expectedMinor} kobo, received ${amountMinor} kobo. Crediting client wallet.`,
+          );
+          // Real money arrived but cannot fund this escrow: put it in the client's wallet
+          // (idempotent on the reference) instead of dropping it.
+          if ((d.currency || 'NGN').toUpperCase() === 'NGN') {
+            const credited = await this.creditWalletOnce(
+              escrow.clientId,
+              `unmatched-${reference}`,
+              amountMinor,
+              `Paystack payment ${reference} did not match the escrow total`,
+            );
+            return {
+              status: 'success',
+              message: credited
+                ? 'Charge amount did not match escrow total; credited to client wallet'
+                : 'Unmatched charge already credited (idempotent)',
+            };
+          }
+          return { status: 'ignored', message: 'Charge amount does not match escrow total' };
+        }
+
+        try {
+          await this.escrowService.lockFunds(escrow.id, 'ONLINE');
+        } catch (err: any) {
+          // Lost a race (wallet funding or a parallel webhook delivery) between our status
+          // read and the locked update: re-read and treat it as already funded.
+          if (err instanceof BadRequestException) {
+            const fresh = await this.escrowService.findOne(escrow.id);
+            if (fresh.totalStatus !== EscrowStatus.INITIATED) {
+              return this.handleAlreadyFundedEscrow(fresh, reference, amountMinor, d.currency);
+            }
+          }
+          throw err;
+        }
         return { status: 'success', message: 'Escrow funded via online checkout' };
       }
 

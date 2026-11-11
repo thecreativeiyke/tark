@@ -25,6 +25,7 @@ import {
 import { Job, JobStatus } from '../jobs/entities/job.entity';
 import { User, UserRole } from '../users/entities/user.entity';
 import { PaymentsService } from '../payments/payments.service';
+import { WalletLedger, WalletLedgerType } from '../payments/entities/wallet-ledger.entity';
 import { NotificationsService } from '../notifications/notifications.service';
 
 @Injectable()
@@ -305,52 +306,66 @@ export class DisputesService {
       throw new NotFoundException('Client associated with escrow not found');
     }
 
-    // Calculate remaining locked funds available in escrow
-    let totalLockedFunds = 0;
+    // All money maths below is in integer kobo (no floating-point drift).
+    const toKobo = (n: number | string) => Math.round(Number(n) * 100);
+
+    // Remaining locked funds available in escrow
+    let lockedMinor = 0;
     if (escrow.tranche1Status !== TrancheStatus.RELEASED) {
-      totalLockedFunds += Number(escrow.tranche1Amount);
+      lockedMinor += toKobo(escrow.tranche1Amount);
     }
     if (escrow.tranche2Status !== TrancheStatus.RELEASED) {
-      totalLockedFunds += Number(escrow.tranche2Amount);
+      lockedMinor += toKobo(escrow.tranche2Amount);
     }
 
-    let clientRefund = 0;
-    let artisanPayout = 0;
+    // ADR 002: the platform fee is non-refundable under every verdict, so only the
+    // remainder after the fee can be distributed to the parties.
+    const feeMinor = Math.min(toKobo(escrow.platformFeeAmount || 0), lockedMinor);
+    const distributableMinor = lockedMinor - feeMinor;
+
+    let clientRefundMinor = 0;
+    let artisanPayoutMinor = 0;
 
     switch (dto.verdict) {
       case DisputeVerdict.FULL_REFUND_TO_CLIENT:
-        clientRefund = totalLockedFunds;
-        artisanPayout = 0;
+        clientRefundMinor = distributableMinor;
         break;
 
       case DisputeVerdict.FULL_PAYOUT_TO_ARTISAN:
-        clientRefund = 0;
-        artisanPayout = totalLockedFunds;
+        artisanPayoutMinor = distributableMinor;
         break;
 
       case DisputeVerdict.SPLIT_SETTLEMENT: {
-        const reqClient = Number(dto.clientRefundAmount || 0);
-        const reqArtisan = Number(dto.artisanPayoutAmount || 0);
+        const reqClientMinor = toKobo(dto.clientRefundAmount || 0);
+        const reqArtisanMinor = toKobo(dto.artisanPayoutAmount || 0);
 
-        if (Math.round(reqClient + reqArtisan) !== Math.round(totalLockedFunds)) {
+        if (reqClientMinor + reqArtisanMinor !== distributableMinor) {
           throw new BadRequestException(
-            `Split amounts (Client: ₦${reqClient} + Artisan: ₦${reqArtisan} = ₦${reqClient + reqArtisan}) ` +
-            `must equal the total locked escrow balance of ₦${totalLockedFunds}`,
+            `Split amounts (Client: ₦${reqClientMinor / 100} + Artisan: ₦${reqArtisanMinor / 100} = ₦${(reqClientMinor + reqArtisanMinor) / 100}) ` +
+              `must equal the distributable escrow balance of ₦${distributableMinor / 100} ` +
+              `(locked ₦${lockedMinor / 100} minus the non-refundable platform fee of ₦${feeMinor / 100})`,
           );
         }
-        clientRefund = reqClient;
-        artisanPayout = reqArtisan;
+        clientRefundMinor = reqClientMinor;
+        artisanPayoutMinor = reqArtisanMinor;
         break;
       }
 
       case DisputeVerdict.MUTUAL_CANCELLATION:
-        clientRefund = totalLockedFunds;
-        artisanPayout = 0;
+        clientRefundMinor = distributableMinor;
         break;
 
       default:
         throw new BadRequestException('Invalid dispute resolution verdict');
     }
+
+    if (artisanPayoutMinor > 0 && !artisan) {
+      throw new BadRequestException('Cannot pay out: no artisan is assigned to this escrow');
+    }
+
+    const clientRefund = clientRefundMinor / 100;
+    const artisanPayout = artisanPayoutMinor / 100;
+    const feeRetained = feeMinor / 100;
 
     // Execute financial execution and database mutations in an atomic transaction
     return this.dataSource.transaction(async (manager) => {
@@ -379,8 +394,21 @@ export class DisputesService {
           throw new NotFoundException('Client record not found during wallet settlement');
         }
 
-        lockedClient.walletBalance = Number(lockedClient.walletBalance || 0) + clientRefund;
+        lockedClient.walletBalance =
+          (Math.round(Number(lockedClient.walletBalance || 0) * 100) + clientRefundMinor) / 100;
         await manager.save(User, lockedClient);
+
+        // Audit trail; the UNIQUE reference also makes a second credit for this dispute impossible
+        await manager.save(
+          WalletLedger,
+          manager.create(WalletLedger, {
+            reference: `dispute-refund-${dispute.id}`,
+            userId: client.id,
+            amount: clientRefund,
+            type: WalletLedgerType.CREDIT,
+            description: `Dispute refund for Job #${escrow.jobId.slice(0, 8)}`,
+          }),
+        );
         this.logger.log(`Dispute Refund: ₦${clientRefund} credited to Client (${client.id}) wallet`);
       }
 
@@ -407,6 +435,7 @@ export class DisputesService {
 
       // 3. Update Escrow status
       lockedEscrow.totalStatus = EscrowStatus.SETTLED;
+      lockedEscrow.feeCollectedMinor = feeMinor;
       if (clientRefund > 0 && artisanPayout === 0) {
         lockedEscrow.tranche1Status = TrancheStatus.REFUNDED;
         lockedEscrow.tranche2Status = TrancheStatus.REFUNDED;
@@ -474,7 +503,8 @@ export class DisputesService {
         disbursement: {
           clientRefundedToWallet: clientRefund,
           artisanDisbursedToBank: artisanPayout,
-          platformServiceFeeRetained: true,
+          platformServiceFeeRetained: feeRetained > 0,
+          platformFeeRetainedAmount: feeRetained,
         },
       };
     });

@@ -51,3 +51,18 @@ Following a dual-agent offensive security review (destructive static penetration
 - All schema additions (`handshakeCycles`, `handshakeLockedUntil`, `feeCollectedMinor`, `wallet_ledgers`) must be documented in versioned migration scripts.
 - Every future financial endpoint or state transition MUST be accompanied by an executable red-team penetration script verifying adversarial scenarios (double-spend, race condition, replay, rounding attack).
 - Active test suites `scripts/redteam-active-hack-phase1.js` and `scripts/redteam-active-hack-phase2.js` serve as continuous regression gates.
+
+---
+
+## Amendment: Phase 3 Hardening & Defect Remediation (2026-11-11)
+
+Following peer cross-check by Claude Desktop, the following deep architectural patches were applied and live-verified:
+
+1. **Paystack Sandbox Guard**: Fake virtual accounts (`96xxxxxxx`) and sandbox checkout URLs are strictly restricted behind `PAYMENTS_SANDBOX_FALLBACK=true` outside production. Production calls throw a 502 Bad Gateway to prevent real customer transfers to simulated accounts.
+2. **Atomic Wallet Funding (H-8)**: `PaymentsService.fundEscrowWithWallet()` locks `EscrowTransaction` first, re-verifies `INITIATED` status, acquires a row lock on `User`, debits balance, inserts `wdebit-${escrowId}` into `WalletLedger`, sets `fundedVia = 'WALLET'`, and locks funds inside a single atomic transaction.
+3. **Webhook Money Retention**: Overpayments or late online payments on wallet-funded escrows are credited to the client's wallet with idempotent ledger references (`overpay-${ref}`, `unmatched-${ref}`) rather than dropped.
+4. **Dispute Fee Enforcement (H-9)**: Platform service fee is strictly subtracted in integer kobo before distributing settlement funds across all verdicts (`FULL_REFUND`, `FULL_PAYOUT`, `SPLIT_SETTLEMENT`). Refunds write `dispute-refund-${dispute.id}` to `WalletLedger`.
+5. **Fail-Closed Location Coarsening**: Commaless addresses default to "Exact location shared after assignment"; location field removed from public text search to eliminate oracle probing.
+6. **Admin Role Enum Alignment**: Corrected uppercase string checks (`'ADMIN'`) to `UserRole.ADMIN` (`'admin'`).
+7. **Payout Direct-Update Prevention**: Removed `payoutProvider`, `payoutAccountIdentifier`, and `payoutBankOrNetwork` from `UpdateProfileDto` to mandate verified onboarding via `/payments/bank/save`.
+
