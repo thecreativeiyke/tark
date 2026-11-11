@@ -167,6 +167,13 @@ export class EscrowService {
   ): Promise<EscrowTransaction> {
     const recipientCode = await this.requirePayoutRecipient(manager, escrow);
 
+    if (
+      escrow.tranche1Status === TrancheStatus.PAYOUT_PENDING ||
+      escrow.tranche2Status === TrancheStatus.PAYOUT_PENDING
+    ) {
+      throw new BadRequestException('A payout is currently pending provider confirmation on this escrow');
+    }
+
     const t1UnpaidMinor =
       escrow.tranche1Status !== TrancheStatus.RELEASED
         ? this.toMinor(escrow.tranche1Amount)
@@ -178,28 +185,47 @@ export class EscrowService {
       throw new BadRequestException('There is nothing left to pay out on this escrow after platform fee');
     }
 
-    const transfer = await this.paymentsService.initiateTransfer(
-      amountMinor,
-      recipientCode,
-      `Tark Payout: ${label} for Job #${escrow.jobId.slice(0, 8)}`,
-      escrow.currency,
-      // Same reference for every final payout attempt on this escrow, so the
-      // provider rejects a duplicate even if our own bookkeeping failed.
-      `tark-final-${escrow.id}`,
-    );
-    this.noteIfSimulated(transfer, escrow.id);
+    // Step 1: Deterministic idempotency reference
+    const transferRef = `tark-final-${escrow.id}`;
 
-    escrow.tranche1Status = TrancheStatus.RELEASED;
-    escrow.tranche2Status = TrancheStatus.RELEASED;
-    escrow.totalStatus = EscrowStatus.SETTLED;
+    // Step 2: Atomic commit to PAYOUT_PENDING
+    if (escrow.tranche1Status !== TrancheStatus.RELEASED) {
+      escrow.tranche1Status = TrancheStatus.PAYOUT_PENDING;
+    }
+    escrow.tranche2Status = TrancheStatus.PAYOUT_PENDING;
+    escrow.tranche2TransferRef = transferRef;
+    escrow.feeCollectedMinor = Math.min(feeMinor, grossFinalMinor);
     escrow.handshakePin = null;
     escrow.handshakeExpiresAt = null;
     escrow.handshakePinAttempts = 0;
-    escrow.tranche2TransferRef = transfer.reference ?? null;
-    escrow.feeCollectedMinor = Math.min(feeMinor, grossFinalMinor);
+    await manager.save(EscrowTransaction, escrow);
 
-    await manager.update(Job, escrow.jobId, { status: JobStatus.COMPLETED });
-    return manager.save(EscrowTransaction, escrow);
+    // Step 3: Out-of-lock / safe gateway dispatch
+    try {
+      const transfer = await this.paymentsService.initiateTransfer(
+        amountMinor,
+        recipientCode,
+        `Tark Payout: ${label} for Job #${escrow.jobId.slice(0, 8)}`,
+        escrow.currency,
+        transferRef,
+      );
+      this.noteIfSimulated(transfer, escrow.id);
+
+      // If simulated or immediate success, finalize in DB
+      escrow.tranche1Status = TrancheStatus.RELEASED;
+      escrow.tranche2Status = TrancheStatus.RELEASED;
+      escrow.totalStatus = EscrowStatus.SETTLED;
+      await manager.update(Job, escrow.jobId, { status: JobStatus.COMPLETED });
+      return manager.save(EscrowTransaction, escrow);
+    } catch (err: any) {
+      // If the gateway rejected definitively (e.g. invalid recipient), mark PAYOUT_FAILED
+      if (err?.statusCategory === 'REJECTED') {
+        escrow.tranche2Status = TrancheStatus.PAYOUT_FAILED;
+        await manager.save(EscrowTransaction, escrow);
+      }
+      // If UNKNOWN / ambiguous network timeout, leave as PAYOUT_PENDING for webhook reconciliation
+      throw err;
+    }
   }
 
   // ─────────────────────────────────────────────────────────────────────
@@ -411,21 +437,33 @@ export class EscrowService {
       }
 
       const recipientCode = await this.requirePayoutRecipient(manager, escrow);
+      const transferRef = `tark-t1-${escrow.id}`;
 
-      const transfer = await this.paymentsService.initiateTransfer(
-        this.toMinor(escrow.tranche1Amount),
-        recipientCode,
-        `Tark Payout: Tranche 1 for Job #${escrow.jobId.slice(0, 8)}`,
-        escrow.currency,
-        `tark-t1-${escrow.id}`,
-      );
-      this.noteIfSimulated(transfer, escrow.id);
+      // Mark PAYOUT_PENDING first
+      escrow.tranche1Status = TrancheStatus.PAYOUT_PENDING;
+      escrow.tranche1TransferRef = transferRef;
+      await manager.save(EscrowTransaction, escrow);
 
-      escrow.tranche1Status = TrancheStatus.RELEASED;
-      escrow.totalStatus = EscrowStatus.TRANCHE_1_RELEASED;
-      escrow.tranche1TransferRef = transfer.reference ?? null;
+      try {
+        const transfer = await this.paymentsService.initiateTransfer(
+          this.toMinor(escrow.tranche1Amount),
+          recipientCode,
+          `Tark Payout: Tranche 1 for Job #${escrow.jobId.slice(0, 8)}`,
+          escrow.currency,
+          transferRef,
+        );
+        this.noteIfSimulated(transfer, escrow.id);
 
-      return manager.save(EscrowTransaction, escrow);
+        escrow.tranche1Status = TrancheStatus.RELEASED;
+        escrow.totalStatus = EscrowStatus.TRANCHE_1_RELEASED;
+        return manager.save(EscrowTransaction, escrow);
+      } catch (err: any) {
+        if (err?.statusCategory === 'REJECTED') {
+          escrow.tranche1Status = TrancheStatus.PAYOUT_FAILED;
+          await manager.save(EscrowTransaction, escrow);
+        }
+        throw err;
+      }
     });
 
     // Notify artisan of mobilization disbursement

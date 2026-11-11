@@ -19,7 +19,9 @@ export enum EscrowStatus {
 export enum TrancheStatus {
   PENDING = 'PENDING',
   LOCKED = 'LOCKED',
+  PAYOUT_PENDING = 'PAYOUT_PENDING',
   RELEASED = 'RELEASED',
+  PAYOUT_FAILED = 'PAYOUT_FAILED',
   REFUNDED = 'REFUNDED',
 }
 

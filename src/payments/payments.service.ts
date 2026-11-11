@@ -14,7 +14,7 @@ import { InjectRepository, InjectDataSource } from '@nestjs/typeorm';
 import { Repository, DataSource } from 'typeorm';
 import axios from 'axios';
 import { EscrowService } from '../escrow/escrow.service';
-import { EscrowStatus, EscrowTransaction } from '../escrow/entities/escrow-transaction.entity';
+import { EscrowStatus, EscrowTransaction, TrancheStatus } from '../escrow/entities/escrow-transaction.entity';
 import { User } from '../users/entities/user.entity';
 import { Job } from '../jobs/entities/job.entity';
 import { WalletLedger, WalletLedgerType } from './entities/wallet-ledger.entity';
@@ -753,6 +753,119 @@ export class PaymentsService {
         } finally {
           await queryRunner.release();
         }
+      }
+    }
+
+    if (event?.event === 'transfer.success') {
+      const d = event.data ?? {};
+      const reference = typeof d.reference === 'string' ? d.reference.trim() : '';
+      if (!reference) {
+        return { status: 'ignored', message: 'Missing transfer reference' };
+      }
+
+      this.logger.log(`Paystack transfer.success received for reference: ${reference}`);
+
+      // Handle Tranche 1, Tranche 2/Final, or Dispute payout
+      const queryRunner = this.dataSource.createQueryRunner();
+      await queryRunner.connect();
+      await queryRunner.startTransaction();
+
+      try {
+        const escrow = await queryRunner.manager.findOne(EscrowTransaction, {
+          where: [
+            { tranche1TransferRef: reference },
+            { tranche2TransferRef: reference },
+          ],
+          lock: { mode: 'pessimistic_write' },
+        });
+
+        if (!escrow) {
+          await queryRunner.rollbackTransaction();
+          this.logger.warn(`No escrow found matching transfer reference: ${reference}`);
+          return { status: 'ignored', message: 'No matching escrow for transfer reference' };
+        }
+
+        let updated = false;
+        if (escrow.tranche1TransferRef === reference && escrow.tranche1Status !== TrancheStatus.RELEASED) {
+          escrow.tranche1Status = TrancheStatus.RELEASED;
+          if (escrow.totalStatus === EscrowStatus.FUNDS_LOCKED) {
+            escrow.totalStatus = EscrowStatus.TRANCHE_1_RELEASED;
+          }
+          updated = true;
+        }
+
+        if (escrow.tranche2TransferRef === reference && escrow.tranche2Status !== TrancheStatus.RELEASED) {
+          escrow.tranche2Status = TrancheStatus.RELEASED;
+          escrow.totalStatus = EscrowStatus.SETTLED;
+          await queryRunner.manager.update(Job, escrow.jobId, { status: 'COMPLETED' as any });
+          updated = true;
+        }
+
+        if (updated) {
+          await queryRunner.manager.save(EscrowTransaction, escrow);
+        }
+
+        await queryRunner.commitTransaction();
+        return {
+          status: 'success',
+          message: `Transfer ${reference} confirmed and escrow updated`,
+        };
+      } catch (err: any) {
+        await queryRunner.rollbackTransaction();
+        this.logger.error(`Error processing transfer.success for ref ${reference}: ${err.message}`);
+        throw err;
+      } finally {
+        await queryRunner.release();
+      }
+    }
+
+    if (event?.event === 'transfer.failed' || event?.event === 'transfer.reversed') {
+      const d = event.data ?? {};
+      const reference = typeof d.reference === 'string' ? d.reference.trim() : '';
+      if (!reference) {
+        return { status: 'ignored', message: 'Missing transfer reference' };
+      }
+
+      this.logger.error(`Paystack ${event} received for reference: ${reference}`);
+
+      const queryRunner = this.dataSource.createQueryRunner();
+      await queryRunner.connect();
+      await queryRunner.startTransaction();
+
+      try {
+        const escrow = await queryRunner.manager.findOne(EscrowTransaction, {
+          where: [
+            { tranche1TransferRef: reference },
+            { tranche2TransferRef: reference },
+          ],
+          lock: { mode: 'pessimistic_write' },
+        });
+
+        if (!escrow) {
+          await queryRunner.rollbackTransaction();
+          return { status: 'ignored', message: 'No matching escrow for transfer reference' };
+        }
+
+        if (escrow.tranche1TransferRef === reference) {
+          escrow.tranche1Status = TrancheStatus.PAYOUT_FAILED;
+        }
+        if (escrow.tranche2TransferRef === reference) {
+          escrow.tranche2Status = TrancheStatus.PAYOUT_FAILED;
+        }
+
+        await queryRunner.manager.save(EscrowTransaction, escrow);
+        await queryRunner.commitTransaction();
+
+        return {
+          status: 'success',
+          message: `Transfer ${reference} marked as PAYOUT_FAILED`,
+        };
+      } catch (err: any) {
+        await queryRunner.rollbackTransaction();
+        this.logger.error(`Error processing ${event} for ref ${reference}: ${err.message}`);
+        throw err;
+      } finally {
+        await queryRunner.release();
       }
     }
 
