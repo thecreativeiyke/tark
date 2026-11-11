@@ -5,6 +5,7 @@ import {
   Patch,
   Body,
   Param,
+  Query,
   UseGuards,
   Request,
 } from '@nestjs/common';
@@ -13,6 +14,9 @@ import { CreateEscrowDto } from './dto/create-escrow.dto';
 import { VerifyHandshakeDto } from './dto/verify-handshake.dto';
 import { InitiateHandshakeDto } from './dto/initiate-handshake.dto';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
+import { RolesGuard } from '../auth/guards/roles.guard';
+import { Roles } from '../auth/decorators/roles.decorator';
+import { UserRole } from '../users/entities/user.entity';
 
 interface AuthenticatedRequest extends Request {
   user: {
@@ -26,6 +30,22 @@ interface AuthenticatedRequest extends Request {
 @UseGuards(JwtAuthGuard)
 export class EscrowController {
   constructor(private readonly escrowService: EscrowService) {}
+
+  // Admin only. Asks the payment provider about every payout still PAYOUT_PENDING and applies the
+  // answer. Also runs automatically on a timer in production (see EscrowService.onModuleInit).
+  @Post('admin/reconcile-payouts')
+  @UseGuards(RolesGuard)
+  @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
+  reconcilePayouts(
+    @Query('olderThanSeconds') olderThanSeconds?: string,
+    @Query('notFoundGraceSeconds') notFoundGraceSeconds?: string,
+  ) {
+    const num = (v?: string) => (v !== undefined && Number.isFinite(Number(v)) ? Number(v) : undefined);
+    return this.escrowService.reconcilePendingPayouts({
+      olderThanSeconds: num(olderThanSeconds),
+      notFoundGraceSeconds: num(notFoundGraceSeconds),
+    });
+  }
 
   @Post()
   create(

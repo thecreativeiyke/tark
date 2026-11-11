@@ -23,7 +23,15 @@ import {
 export class PaystackGateway implements IPaymentGateway {
   readonly providerName = 'paystack';
   private readonly logger = new Logger(PaystackGateway.name);
-  private readonly baseUrl = 'https://api.paystack.co';
+  // Production always talks to the real Paystack API. Outside production, PAYSTACK_BASE_URL may point
+  // at a local fake (scripts/test-payout-two-phase.js) so failure paths can be exercised safely.
+  private get baseUrl(): string {
+    const override = this.configService.get<string>('PAYSTACK_BASE_URL');
+    if (override && this.configService.get<string>('NODE_ENV') !== 'production') {
+      return override.replace(/\/+$/, '');
+    }
+    return 'https://api.paystack.co';
+  }
 
   constructor(private configService: ConfigService) {}
 

@@ -320,6 +320,17 @@ export class DisputesService {
         throw new BadRequestException('Escrow is no longer in DISPUTED status');
       }
 
+      // A tranche whose payout is still awaiting provider confirmation is NOT yet known to be paid or
+      // unpaid. Resolving now could refund money the artisan is about to receive (or the reverse).
+      if (
+        lockedEscrow.tranche1Status === TrancheStatus.PAYOUT_PENDING ||
+        lockedEscrow.tranche2Status === TrancheStatus.PAYOUT_PENDING
+      ) {
+        throw new BadRequestException(
+          'A payout on this escrow is still awaiting provider confirmation. Resolve the dispute once it has settled.',
+        );
+      }
+
       // All money maths below is in integer kobo (no floating-point drift), calculated under lock
       const toKobo = (n: number | string) => Math.round(Number(n) * 100);
 
