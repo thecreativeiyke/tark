@@ -7,10 +7,12 @@ import {
   Logger,
   Inject,
   forwardRef,
+  InternalServerErrorException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, DataSource, In, Not } from 'typeorm';
 import * as crypto from 'crypto';
+import { ConfigService } from '@nestjs/config';
 import { KycRecord, KycStatus } from './entities/kyc-record.entity';
 import { User, UserRole } from '../users/entities/user.entity';
 import { SubmitKycDto } from './dto/submit-kyc.dto';
@@ -31,12 +33,46 @@ export class KycService {
     private userRepository: Repository<User>,
     private triageService: KycTriageService,
     private dataSource: DataSource,
+    private configService: ConfigService,
     @Inject(forwardRef(() => NotificationsService))
     private notificationsService: NotificationsService,
   ) {}
 
   private computeFallbackSha256(seed: string): string {
     return crypto.createHash('sha256').update(seed).digest('hex');
+  }
+
+  /**
+   * Rejects any KYC document URL that does not originate from the Tark CDN.
+   * Mirrors the escrow validateProofUrls() pattern — prevents artisans from
+   * pointing documentUrl/selfieUrl at external servers (SSRF bait, bypass).
+   */
+  private validateKycUrls(documentUrl: string, selfieUrl: string): void {
+    const cdn = this.configService.get<string>('STORAGE_CUSTOM_CDN_URL');
+    let cdnHost: string;
+    try {
+      cdnHost = new URL(cdn ?? '').host;
+    } catch {
+      throw new InternalServerErrorException('KYC document storage is not configured');
+    }
+
+    for (const [label, raw] of [
+      ['documentUrl', documentUrl],
+      ['selfieUrl', selfieUrl],
+    ] as [string, string][]) {
+      let parsed: URL;
+      try {
+        parsed = new URL(raw);
+      } catch {
+        throw new BadRequestException(`${label} must be a valid URL`);
+      }
+      if (parsed.protocol !== 'https:' || parsed.host !== cdnHost) {
+        throw new BadRequestException(
+          `${label} must be a document uploaded through Tark. ` +
+            'Please upload the file in the app and use the returned URL.',
+        );
+      }
+    }
   }
 
   /**
@@ -50,6 +86,9 @@ export class KycService {
     if (role !== UserRole.ARTISAN && role !== UserRole.SUPER_ADMIN && role !== UserRole.ADMIN) {
       throw new BadRequestException('Only registered artisans may submit credentials to the Tark Verification Desk.');
     }
+
+    // Reject any URL not hosted on the Tark CDN before hitting the database
+    this.validateKycUrls(dto.documentUrl, dto.selfieUrl);
 
     const user = await this.userRepository.findOne({ where: { id: userId } });
     if (!user) {
