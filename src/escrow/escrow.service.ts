@@ -337,6 +337,7 @@ export class EscrowService {
     manager: EntityManager,
     id: string,
     via: 'WALLET' | 'ONLINE' = 'ONLINE',
+    fundingReference?: string,
   ): Promise<EscrowTransaction> {
     const escrow = await this.lockEscrow(manager, id);
 
@@ -348,14 +349,15 @@ export class EscrowService {
     escrow.tranche1Status = TrancheStatus.LOCKED;
     escrow.tranche2Status = TrancheStatus.LOCKED;
     escrow.fundedVia = via;
+    escrow.fundedReference = fundingReference ?? null;
 
     await manager.update(Job, escrow.jobId, { status: JobStatus.IN_PROGRESS });
     return manager.save(EscrowTransaction, escrow);
   }
 
-  async lockFunds(id: string, via: 'WALLET' | 'ONLINE' = 'ONLINE') {
+  async lockFunds(id: string, via: 'WALLET' | 'ONLINE' = 'ONLINE', fundingReference?: string) {
     const saved = await this.dataSource.transaction((manager) =>
-      this.lockFundsInTransaction(manager, id, via),
+      this.lockFundsInTransaction(manager, id, via, fundingReference),
     );
     this.notifyFunded(saved);
     return saved;

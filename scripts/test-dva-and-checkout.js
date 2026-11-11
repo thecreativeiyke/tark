@@ -224,6 +224,54 @@ async function run() {
   console.log('   ✅ Escrow successfully locked with fundedVia: ONLINE!');
 
   // ─────────────────────────────────────────────────────────────────────────────
+  // TEST 5: Replay of the SAME funding webhook must NOT credit the wallet.
+  // Pay-For-Me (step 5) overwrote paystackReference with a newer checkout, so the
+  // paying reference (paystackRef) no longer matches it. Replay detection must use
+  // fundedReference, otherwise this replay is credited as a second payment.
+  // ─────────────────────────────────────────────────────────────────────────────
+  console.log('\n6b Replaying the identical funding webhook (must be idempotent, no wallet credit)...');
+  const replayRes = await req({
+    ...BASE,
+    path: '/payments/webhook',
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-paystack-signature': sig,
+    },
+  }, webhookBody);
+  console.log(`   Replay Response: ${replayRes.status}`, replayRes.data);
+
+  const refCheck = await pgClient.query(`SELECT "fundedReference" FROM escrow_transaction WHERE id = $1`, [escrowId]);
+  if (refCheck.rows[0]?.fundedReference !== paystackRef) {
+    throw new Error(`fundedReference is ${refCheck.rows[0]?.fundedReference}, expected ${paystackRef}`);
+  }
+  const overpay = await pgClient.query(`SELECT 1 FROM wallet_ledgers WHERE reference = $1`, [`overpay-${paystackRef}`]);
+  const walletRow = await pgClient.query(`SELECT "walletBalance" FROM "user" WHERE id = $1`, [clientId]);
+  if (overpay.rowCount > 0 || Number(walletRow.rows[0]?.walletBalance) !== 0) {
+    throw new Error(`REPLAY CREDITED THE WALLET! overpay rows: ${overpay.rowCount}, balance: ${walletRow.rows[0]?.walletBalance}`);
+  }
+  console.log('   ✅ Replay acknowledged idempotently; wallet balance still 0.');
+
+  // A genuinely different reference on the same funded escrow MUST still be credited.
+  console.log('\n6c Paying a DIFFERENT reference on the funded escrow (must credit wallet once)...');
+  const dupRef = `tark-${escrowId}-${Date.now()}`;
+  const dupBody = JSON.stringify({
+    event: 'charge.success',
+    data: { reference: dupRef, amount: 5000000, currency: 'NGN', status: 'success', customer: { customer_code: dvaRes.data.customerCode || 'CUS_test' } },
+  });
+  const dupSig = crypto.createHmac('sha512', paystackSecret).update(dupBody).digest('hex');
+  const dupHeaders = { 'Content-Type': 'application/json', 'x-paystack-signature': dupSig };
+  const dup1 = await req({ ...BASE, path: '/payments/webhook', method: 'POST', headers: dupHeaders }, dupBody);
+  const dup2 = await req({ ...BASE, path: '/payments/webhook', method: 'POST', headers: dupHeaders }, dupBody);
+  console.log('   First :', dup1.data);
+  console.log('   Replay:', dup2.data);
+  const walletAfter = await pgClient.query(`SELECT "walletBalance" FROM "user" WHERE id = $1`, [clientId]);
+  if (Number(walletAfter.rows[0]?.walletBalance) !== 50000) {
+    throw new Error(`Expected wallet 50000 after one genuine overpayment, got ${walletAfter.rows[0]?.walletBalance}`);
+  }
+  console.log('   ✅ Different reference credited exactly once (wallet = 50000), its own replay ignored.');
+
+  // ─────────────────────────────────────────────────────────────────────────────
   // CLEANUP
   // ─────────────────────────────────────────────────────────────────────────────
   console.log('\n7️⃣ Cleaning up test data from Supabase...');

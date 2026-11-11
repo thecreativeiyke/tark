@@ -524,7 +524,12 @@ export class PaymentsService {
     amountMinor: number,
     currency?: string,
   ) {
-    if (escrow.fundedVia === 'ONLINE' && escrow.paystackReference === reference) {
+    // Identical replay of the payment that funded the escrow: acknowledge idempotently.
+    // Compare against fundedReference (the reference that actually paid), NOT paystackReference,
+    // which Pay-For-Me / re-initialisation overwrites with the latest checkout. Escrows funded
+    // before fundedReference existed have it null, so they fall back to the old comparison.
+    const fundingRef = escrow.fundedReference ?? escrow.paystackReference;
+    if (escrow.fundedVia === 'ONLINE' && fundingRef === reference) {
       return { status: 'success', message: 'Escrow already funded (idempotent)' };
     }
 
@@ -676,7 +681,7 @@ export class PaymentsService {
         }
 
         try {
-          await this.escrowService.lockFunds(escrow.id, 'ONLINE');
+          await this.escrowService.lockFunds(escrow.id, 'ONLINE', reference);
         } catch (err: any) {
           // Lost a race (wallet funding or a parallel webhook delivery) between our status
           // read and the locked update: re-read and treat it as already funded.

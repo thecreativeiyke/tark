@@ -90,6 +90,11 @@ export class EscrowTransaction {
   @Column({ type: 'varchar', length: 16, nullable: true })
   fundedVia: string | null;
 
+  // The exact payment reference that funded the escrow online. paystackReference only holds the
+  // LAST checkout started (Pay-For-Me re-initialises it), so replay detection must use this one.
+  @Column({ type: 'varchar', nullable: true })
+  fundedReference: string | null;
+
   // Platform fee actually retained at settlement, in kobo
   @Column({ type: 'integer', default: 0 })
   feeCollectedMinor: number;
