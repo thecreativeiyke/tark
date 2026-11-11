@@ -66,3 +66,42 @@ Following peer cross-check by Claude Desktop, the following deep architectural p
 6. **Admin Role Enum Alignment**: Corrected uppercase string checks (`'ADMIN'`) to `UserRole.ADMIN` (`'admin'`).
 7. **Payout Direct-Update Prevention**: Removed `payoutProvider`, `payoutAccountIdentifier`, and `payoutBankOrNetwork` from `UpdateProfileDto` to mandate verified onboarding via `/payments/bank/save`.
 
+---
+
+## Amendment: Phase 4 — Replay-Proof Online Funding (2026-11-11)
+
+A cross-check of the Phase 3 webhook change found a defect in it, which was then fixed and regression-tested.
+
+### Defect
+Phase 3 amendment item 3 treated a webhook on an already-funded escrow as an idempotent replay only when `escrow.paystackReference === reference`. But `paystackReference` holds only the **most recent** checkout started: `initializePayment` overwrites it, and `GET /payments/pay-for-me/:escrowId` calls `initializePayment` on every request. Sequence that broke it:
+1. Client initialises checkout (reference A), then opens Pay-For-Me (reference B overwrites `paystackReference`).
+2. Client pays link A. The webhook resolves the escrow through the `tark-<escrowId>-` reference fallback and funds it.
+3. The provider redelivers the webhook for A. A ≠ B, so it was treated as a second payment and credited to the client's wallet as `overpay-A`.
+
+Net effect: a replayed funding webhook minted wallet balance equal to the escrow total.
+
+### Decision
+- New column `escrow_transaction.fundedReference` (varchar, nullable), set inside `lockFundsInTransaction` to the exact reference that funded the escrow (`null` for wallet funding). Migration: `scripts/migrate-phase4.js` (idempotent).
+- `PaymentsService.handleAlreadyFundedEscrow` compares the incoming reference to `fundedReference`. Rows funded before this column existed have it `NULL` and fall back to the old `paystackReference` comparison; they are intentionally not backfilled, because the only available value is the unreliable one.
+- Any other reference arriving on a funded escrow (a second checkout paid, or a payment after wallet funding) is credited to the client's wallet once, under the idempotent ledger key `overpay-${reference}`.
+- The concurrent-delivery path (a parallel webhook losing the funding race) goes through the same check, so it also resolves to idempotent rather than a credit.
+
+### Also changed
+- `DisputesService.resolve` now computes `lockedMinor`, `feeMinor` and `distributableMinor` from the escrow row read **under** the `pessimistic_write` lock, not from a read taken before it.
+
+### Verification
+`scripts/test-dva-and-checkout.js` gained two regression steps, run against the live local server and Supabase:
+- **6b**: replay of the exact funding webhook returns idempotent, `fundedReference` equals the paying reference, no `overpay-` row exists, wallet stays 0.
+- **6c**: a different reference on the funded escrow credits the wallet exactly once (50,000); its own replay is ignored.
+
+Step 6b reproduces the exact sequence that broke the pre-fix logic (replay of a reference that is no longer `paystackReference`). It was not run against the old build, so its failing-before behaviour is by reasoning, not observation.
+
+### Corrections to earlier wording
+- Phase 3 item 1 said sandbox **checkout URLs** are gated behind `PAYMENTS_SANDBOX_FALLBACK`. They are not: `initializePayment` has no sandbox branch and always calls the real gateway. The flag gates the simulated DVA, customer code, bank resolution and payout recipient.
+- Phase 3 item 3 says overpayments are credited "rather than dropped". That holds for NGN only: a non-NGN payment on an already-funded escrow is still logged and ignored, not credited.
+
+### Known limits (not addressed here)
+- Verification uses a **simulated** DVA (`Paystack-Titan (Sandbox)`, `96…` account numbers) and webhooks signed locally with the project's own secret. It proves the handler's logic, not real Paystack DVA provisioning or real webhook delivery. A test-key run against a public staging URL is still outstanding.
+- In `DisputesService.resolve` the artisan Paystack transfer is sent before the DB transaction commits. A later failure rolls the DB back but not the transfer. The fixed reference `tark-dispute-${id}` makes a retry safe from a double payout.
+- Upload validation trusts the client-supplied MIME type (see Session 12 timeline entry for the planned magic-byte check).
+

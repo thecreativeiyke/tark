@@ -29,6 +29,35 @@
 
 ## 🗓️ Session Log
 
+### 🗓️ 2026-11-11 — Session 12: Cross-Check of Phase 3 — Webhook Replay Defect Found, Fixed & Regression-Tested
+- **Author**: Claude (cross-check and fix via Claude Desktop + Filesystem extension) & the Founder
+- **Tag**: `[AUDIT]` `[FLAGGED & FIXED]` — Rationale in the Phase 4 amendment of [ADR 009](./docs/adr/009-security-hardening-phase1-phase2.md)
+
+#### ⚠️ Flagged & Fixed:
+1. **Replayed funding webhook minted wallet balance** (introduced in Phase 3, commit `1f8be75`): replay detection compared the incoming reference to `escrow.paystackReference`, which Pay-For-Me / re-initialisation overwrites with the latest checkout. A redelivery of the webhook for the reference that actually paid was therefore credited to the client's wallet as an overpayment.
+   - **Fix**: new `escrow_transaction.fundedReference` column recording the exact paying reference; replay check uses it (legacy rows fall back to `paystackReference`). Migration `scripts/migrate-phase4.js` (run on every database before starting the server).
+   - **Files**: `escrow-transaction.entity.ts`, `escrow.service.ts` (`lockFunds` / `lockFundsInTransaction` take the reference), `payments.service.ts`.
+   - **Commit**: `d115b3f` pushed to `main`.
+2. **Double online payments were swallowed** (commit `921b6eb`): a second, different online reference on an already-ONLINE-funded escrow returned "idempotent" and credited nothing. It is now credited to the client's wallet (`overpay-${ref}`).
+3. **Dispute maths read outside the lock** (commit `921b6eb`): locked amount, fee and distributable balance are now computed from the escrow row read under the `pessimistic_write` lock.
+
+#### 🧪 Verification (what it does and does not prove):
+- `scripts/test-dva-and-checkout.js` now includes **6b** (replay of the paying webhook → idempotent, wallet stays 0) and **6c** (different reference → credited exactly once, its replay ignored). Full suite passed locally after migration, build and restart.
+- **Limits**: the DVA is a simulated sandbox account (`Paystack-Titan (Sandbox)`) and webhooks are signed locally with the project's own secret, so this proves handler logic, not real Paystack DVA provisioning or webhook delivery. 6b was not run against the pre-fix build.
+
+#### 📝 Corrections to earlier entries:
+- Session 11 item 7 says sandbox checkout URLs throw 502 in production. Checkout URLs are not gated; only the simulated DVA, customer code, bank resolution and payout recipient are.
+- Session 11 item 1 says late/overpaid online payments are credited "rather than dropped". True for NGN only; non-NGN is logged and ignored.
+- Session 11's heading "100% Repelled" refers to the scripted attack suites on localhost with simulated provider responses; it is not a statement that the system is fully secure.
+
+#### 🔜 Open / Next (in priority order):
+1. **Upload magic-byte validation**: `media.controller.ts` filters on the client-supplied MIME string only, and `media.service.ts` forwards bytes unchecked. Proof-of-work photos gate payouts, so verify file signatures (JPEG, PNG, WebP, HEIC, MP4/MOV, WebM) and use the detected type.
+2. **Real provider test**: run a Paystack test-key journey against a public staging URL (real webhook delivery, real DVA if available on the account).
+3. **Dispute payout ordering**: the artisan transfer is sent before the DB commit; consider recording a payout intent first, or reconciling on failure.
+4. Deploy staging with `NODE_ENV=production` and tighten CORS (`origin: true` with credentials) before exposing it.
+
+---
+
 ### 🗓️ 2026-11-11 — Session 11: Red-Team Active Penetration Hardening (Phases 1, 2 & 3) — 100% Repelled
 - **Author**: Lead Engineers: Claude (Principal Adversary Audit & Cross-Check) & Antigravity / Gemini (Defense Architecture, Active Exploitation & Live Verification)
 - **Tag**: `[FLAGGED & FIXED]` & `[AUDIT]` & `[SHIPPED]` — Full rationale in [ADR 009](./docs/adr/009-security-hardening-phase1-phase2.md)
