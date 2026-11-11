@@ -515,30 +515,35 @@ export class PaymentsService {
     });
   }
 
-  // An online payment arrived for an escrow that is already funded. If the wallet funded
-  // it, the client has now paid twice: credit the online payment back to their wallet.
-  // Any other case is an idempotent replay of the payment that funded it.
+  // An online payment arrived for an escrow that is already funded. If it is an identical
+  // replay of the payment that funded the escrow, acknowledge it idempotently. If it is a different
+  // reference (second online checkout or payment after wallet funding), credit the money to the client's wallet.
   private async handleAlreadyFundedEscrow(
     escrow: EscrowTransaction,
     reference: string,
     amountMinor: number,
     currency?: string,
   ) {
-    if (escrow.fundedVia === 'WALLET' && (currency || 'NGN').toUpperCase() === 'NGN') {
+    if (escrow.fundedVia === 'ONLINE' && escrow.paystackReference === reference) {
+      return { status: 'success', message: 'Escrow already funded (idempotent)' };
+    }
+
+    if ((currency || 'NGN').toUpperCase() === 'NGN') {
       const credited = await this.creditWalletOnce(
         escrow.clientId,
         `overpay-${reference}`,
         amountMinor,
-        `Paystack payment ${reference} received after escrow was already funded from wallet`,
+        `Paystack payment ${reference} received after escrow was already funded (${escrow.fundedVia || 'previously'})`,
       );
       return {
         status: 'success',
         message: credited
-          ? 'Escrow already funded from wallet; online payment credited to client wallet'
+          ? 'Escrow already funded; additional payment credited to client wallet'
           : 'Duplicate payment already credited (idempotent)',
       };
     }
-    return { status: 'success', message: 'Escrow already funded (idempotent)' };
+
+    return { status: 'ignored', message: 'Escrow already funded in non-NGN currency' };
   }
 
   // Credits a user's wallet exactly once per ledgerRef (UNIQUE constraint + existence check).
@@ -617,7 +622,20 @@ export class PaymentsService {
       }
 
       // 1. Escrow direct checkout path
-      const escrow = await this.escrowService.findByReference(reference);
+      let escrow = await this.escrowService.findByReference(reference);
+      if (!escrow) {
+        // Fallback: extract escrowId from tark-<uuid>-timestamp reference pattern or metadata
+        const match = reference.match(/^tark-([0-9a-fA-F-]{36})-/);
+        const escrowIdFromRef = match ? match[1] : d.metadata?.escrowId;
+        if (escrowIdFromRef) {
+          try {
+            escrow = await this.escrowService.findOne(escrowIdFromRef);
+          } catch {
+            // Escrow not found, proceed to wallet deposit path
+          }
+        }
+      }
+
       if (escrow) {
         // Anything past INITIATED means the escrow is already funded (locked, tranche 1
         // released, handshake, disputed or settled). If it was funded from the wallet,

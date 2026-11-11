@@ -306,70 +306,9 @@ export class DisputesService {
       throw new NotFoundException('Client associated with escrow not found');
     }
 
-    // All money maths below is in integer kobo (no floating-point drift).
-    const toKobo = (n: number | string) => Math.round(Number(n) * 100);
-
-    // Remaining locked funds available in escrow
-    let lockedMinor = 0;
-    if (escrow.tranche1Status !== TrancheStatus.RELEASED) {
-      lockedMinor += toKobo(escrow.tranche1Amount);
-    }
-    if (escrow.tranche2Status !== TrancheStatus.RELEASED) {
-      lockedMinor += toKobo(escrow.tranche2Amount);
-    }
-
-    // ADR 002: the platform fee is non-refundable under every verdict, so only the
-    // remainder after the fee can be distributed to the parties.
-    const feeMinor = Math.min(toKobo(escrow.platformFeeAmount || 0), lockedMinor);
-    const distributableMinor = lockedMinor - feeMinor;
-
-    let clientRefundMinor = 0;
-    let artisanPayoutMinor = 0;
-
-    switch (dto.verdict) {
-      case DisputeVerdict.FULL_REFUND_TO_CLIENT:
-        clientRefundMinor = distributableMinor;
-        break;
-
-      case DisputeVerdict.FULL_PAYOUT_TO_ARTISAN:
-        artisanPayoutMinor = distributableMinor;
-        break;
-
-      case DisputeVerdict.SPLIT_SETTLEMENT: {
-        const reqClientMinor = toKobo(dto.clientRefundAmount || 0);
-        const reqArtisanMinor = toKobo(dto.artisanPayoutAmount || 0);
-
-        if (reqClientMinor + reqArtisanMinor !== distributableMinor) {
-          throw new BadRequestException(
-            `Split amounts (Client: ₦${reqClientMinor / 100} + Artisan: ₦${reqArtisanMinor / 100} = ₦${(reqClientMinor + reqArtisanMinor) / 100}) ` +
-              `must equal the distributable escrow balance of ₦${distributableMinor / 100} ` +
-              `(locked ₦${lockedMinor / 100} minus the non-refundable platform fee of ₦${feeMinor / 100})`,
-          );
-        }
-        clientRefundMinor = reqClientMinor;
-        artisanPayoutMinor = reqArtisanMinor;
-        break;
-      }
-
-      case DisputeVerdict.MUTUAL_CANCELLATION:
-        clientRefundMinor = distributableMinor;
-        break;
-
-      default:
-        throw new BadRequestException('Invalid dispute resolution verdict');
-    }
-
-    if (artisanPayoutMinor > 0 && !artisan) {
-      throw new BadRequestException('Cannot pay out: no artisan is assigned to this escrow');
-    }
-
-    const clientRefund = clientRefundMinor / 100;
-    const artisanPayout = artisanPayoutMinor / 100;
-    const feeRetained = feeMinor / 100;
-
     // Execute financial execution and database mutations in an atomic transaction
     return this.dataSource.transaction(async (manager) => {
-      // Lock escrow row to prevent double-settlement
+      // Lock escrow row to prevent double-settlement and concurrent modifications
       const lockedEscrow = await manager
         .getRepository(EscrowTransaction)
         .createQueryBuilder('escrow')
@@ -380,6 +319,67 @@ export class DisputesService {
       if (!lockedEscrow || lockedEscrow.totalStatus !== EscrowStatus.DISPUTED) {
         throw new BadRequestException('Escrow is no longer in DISPUTED status');
       }
+
+      // All money maths below is in integer kobo (no floating-point drift), calculated under lock
+      const toKobo = (n: number | string) => Math.round(Number(n) * 100);
+
+      // Remaining locked funds available in escrow
+      let lockedMinor = 0;
+      if (lockedEscrow.tranche1Status !== TrancheStatus.RELEASED) {
+        lockedMinor += toKobo(lockedEscrow.tranche1Amount);
+      }
+      if (lockedEscrow.tranche2Status !== TrancheStatus.RELEASED) {
+        lockedMinor += toKobo(lockedEscrow.tranche2Amount);
+      }
+
+      // ADR 002: the platform fee is non-refundable under every verdict, so only the
+      // remainder after the fee can be distributed to the parties.
+      const feeMinor = Math.min(toKobo(lockedEscrow.platformFeeAmount || 0), lockedMinor);
+      const distributableMinor = lockedMinor - feeMinor;
+
+      let clientRefundMinor = 0;
+      let artisanPayoutMinor = 0;
+
+      switch (dto.verdict) {
+        case DisputeVerdict.FULL_REFUND_TO_CLIENT:
+          clientRefundMinor = distributableMinor;
+          break;
+
+        case DisputeVerdict.FULL_PAYOUT_TO_ARTISAN:
+          artisanPayoutMinor = distributableMinor;
+          break;
+
+        case DisputeVerdict.SPLIT_SETTLEMENT: {
+          const reqClientMinor = toKobo(dto.clientRefundAmount || 0);
+          const reqArtisanMinor = toKobo(dto.artisanPayoutAmount || 0);
+
+          if (reqClientMinor + reqArtisanMinor !== distributableMinor) {
+            throw new BadRequestException(
+              `Split amounts (Client: ₦${reqClientMinor / 100} + Artisan: ₦${reqArtisanMinor / 100} = ₦${(reqClientMinor + reqArtisanMinor) / 100}) ` +
+                `must equal the distributable escrow balance of ₦${distributableMinor / 100} ` +
+                `(locked ₦${lockedMinor / 100} minus the non-refundable platform fee of ₦${feeMinor / 100})`,
+            );
+          }
+          clientRefundMinor = reqClientMinor;
+          artisanPayoutMinor = reqArtisanMinor;
+          break;
+        }
+
+        case DisputeVerdict.MUTUAL_CANCELLATION:
+          clientRefundMinor = distributableMinor;
+          break;
+
+        default:
+          throw new BadRequestException('Invalid dispute resolution verdict');
+      }
+
+      if (artisanPayoutMinor > 0 && !artisan) {
+        throw new BadRequestException('Cannot pay out: no artisan is assigned to this escrow');
+      }
+
+      const clientRefund = clientRefundMinor / 100;
+      const artisanPayout = artisanPayoutMinor / 100;
+      const feeRetained = feeMinor / 100;
 
       // 1. Credit Client In-App Wallet with pessimistic row lock
       if (clientRefund > 0) {
