@@ -103,5 +103,124 @@ Step 6b reproduces the exact sequence that broke the pre-fix logic (replay of a 
 ### Known limits (not addressed here)
 - Verification uses a **simulated** DVA (`Paystack-Titan (Sandbox)`, `96…` account numbers) and webhooks signed locally with the project's own secret. It proves the handler's logic, not real Paystack DVA provisioning or real webhook delivery. A test-key run against a public staging URL is still outstanding.
 - In `DisputesService.resolve` the artisan Paystack transfer is sent before the DB transaction commits. A later failure rolls the DB back but not the transfer. The fixed reference `tark-dispute-${id}` makes a retry safe from a double payout.
-- Upload validation trusts the client-supplied MIME type (see Session 12 timeline entry for the planned magic-byte check).
+
+---
+
+## Amendment: Phase 5 — Upload Magic-Byte Binary Inspection & Filename Normalization (2026-11-12)
+
+### Context & Threat Model
+Upload endpoints (`/media/upload`, `/media/proof-of-work`, `/media/job-diagnostics`, `/media/avatar`) previously filtered files using client-supplied MIME headers and multer extensions. An adversary could upload arbitrary hostile payloads (PHP shells, HTML/JS stored XSS, script-bearing SVGs, Windows/ELF executables) with spoofed headers (e.g. `image/png`).
+
+### Decision
+1. **Magic-Byte Signature Inspection (`src/media/file-signature.ts`)**:
+   - Inspects the leading binary header bytes of all uploaded buffers.
+   - Whitelists only approved binary formats:
+     - Images: JPEG (`FF D8 FF`), PNG (`89 50 4E 47 0D 0A 1A 0A`), WebP (`RIFF...WEBP`), HEIC (`ftypheic`, `ftypmif1`).
+     - Videos: MP4 (`ftypisom`, `ftypmp42`), MOV (`ftypqt`), WebM (`1A 45 DF A3`).
+   - Rejects all other formats including HTML, SVG, PHP, executables (MZ, ELF), ZIPs, GIFs, and AVIFs.
+2. **Family & Intent Cross-Validation**:
+   - Compares detected binary type against claimed category (e.g. MP4 cannot masquerade as `image/png`).
+   - Avatar uploads strictly require an image family.
+3. **Atomic Batch Inspection**:
+   - Multi-file uploads (e.g. Proof of Work) validate all buffers before dispatching any to Cloudflare R2, ensuring no orphan files are left on rejected batches.
+4. **Filename Normalization & Path Traversal Neutralization**:
+   - `safeFilename()` strips directory traversal sequences (`../`, `..\`) and neutralizes double extensions (e.g. `shell.php.png` -> sanitized safe stem + detected extension).
+
+### Verification
+- `scripts/test-upload-magic-bytes.js`:
+  - **Part A (Offline Detector)**: 9 accepted formats, 14 rejected formats, filename sanitization.
+  - **Part B (Live Hostile Exploitation)**: 11 attack vectors tested against live endpoints (HTML disguised as PNG, PHP disguised as JPEG, EXE disguised as PNG, batch with one fake, unauthenticated uploads) — 41/41 checks passed.
+
+---
+
+## Amendment: Phase 6 — KYC Document & Selfie URL Shield (2026-11-12)
+
+### Context
+`POST /kyc/submit` accepts `documentUrl` and `selfieUrl`. Without server-side URL validation, an artisan could submit hostile external links (`https://evil-attacker.com/doc.png`) or spoofed phishing domains, causing internal compliance viewers or administrative reviewers to fetch external untrusted content.
+
+### Decision
+- Implemented `validateKycUrls()` in `src/kyc/kyc.service.ts`.
+- Validates that both `documentUrl` and `selfieUrl` are valid HTTPS URLs whose parsed `origin` and `pathname` strictly match the configured Tark Cloudflare CDN gateway base (`STORAGE_CUSTOM_CDN_URL` or default `https://iyke-storage-gateway.iyke-storage-gateway.workers.dev/cdn`).
+- Submissions with non-Tark CDN domains or spoofed hostnames are rejected with `400 Bad Request`.
+
+### Verification
+- `scripts/test-kyc-url-validation.js` verified live against the server and database:
+  - Hostile external document URL rejected (400)
+  - Hostile external selfie URL rejected (400)
+  - Spoofed CDN domain rejected (400)
+  - Legitimate Tark CDN URL accepted (201)
+
+---
+
+## Amendment: Phase 7 — Two-Phase Decoupled Payout State Machine & Sweeper (2026-11-12)
+
+### Context & Flaw in Previous Implementation
+In the previous implementation (`7ae6dfb`), external calls to `PaystackGateway.initiateTransfer()` were executed inside the database transaction holding row locks. Consequently:
+1. Provider timeouts or network drops rolled back the database transaction, losing the record that a transfer had been requested.
+2. Late incoming `transfer.success` webhooks could not match any `PAYOUT_PENDING` record.
+3. Paystack's initial response can be `pending` or `otp` (meaning funds have not yet left); treating non-throwing initiation as settled caused premature job completion.
+
+### Decision
+1. **Two-Phase Decoupled Commit**:
+   - **Phase 1 (In Lock)**: Acquires pessimistic write lock on `EscrowTransaction`, sets `trancheStatus` to `PAYOUT_PENDING`, records a deterministic transfer reference (`tark-t1-<id>` or `tark-t2-<id>`), and commits immediately.
+   - **External Gateway Call (Out of Lock)**: Calls Paystack outside the database lock, preventing connection pool exhaustion and database freeze during third-party latency.
+   - **Phase 2 (In Lock)**: Applies outcome via centralized `applyTransferOutcome()` based on verified Paystack status:
+     - `success` -> marks tranche `RELEASED`, settles escrow / completes job if final.
+     - `pending` / `otp` / unknown timeout -> leaves tranche `PAYOUT_PENDING` for webhook or sweeper reconciliation.
+     - `failed` / definitive provider rejection -> marks tranche `PAYOUT_FAILED`, allowing safe retry with incremented reference (`tark-t1-<id>-r1`).
+2. **Reconciliation Sweeper**:
+   - Periodic sweeper queries `PAYOUT_PENDING` tranches stuck beyond threshold and invokes `verifyTransfer()` to reconcile status.
+3. **Transfer Webhook Handlers**:
+   - `transfer.success`, `transfer.failed`, and `transfer.reversed` routed through `applyTransferOutcome()`.
+   - Late `transfer.failed` webhooks on already settled escrows are ignored (idempotent).
+4. **Database Migration**:
+   - `scripts/migrate-payout-states.js` added `PAYOUT_PENDING` and `PAYOUT_FAILED` to PostgreSQL tranche status enums.
+
+### Verification
+- Tested via `scripts/test-payout-two-phase.js` using local Paystack stub simulating provider delay, timeout, OTP, failure, and sweeper resolution.
+
+---
+
+## Amendment: Phase 8 — Authentication Lifecycle, Session Revocation & Timing Attack Hardening (2026-11-14)
+
+### Context
+Security review identified gaps in user identity and session lifecycle:
+1. Missing forgot-password, reset-password, and change-password flows.
+2. User account enumeration via timing differences between registered and non-registered emails.
+3. Absence of JWT token revocation: demoted admins, banned users, or accounts after password reset maintained valid token access until JWT expiry.
+4. Case-sensitivity collision: registering variations of existing emails (e.g. `Test@tark.ng` vs `test@tark.ng`).
+
+### Decision
+1. **Cryptographic Token Hashing for Password Reset**:
+   - `POST /auth/forgot-password` generates a 32-byte cryptographic random hex token.
+   - Computes SHA-256 hash and stores `passwordResetTokenHash` and `passwordResetExpiresAt` (30 minutes) on the `"user"` table.
+   - Raw token is delivered out-of-band via notifications (email link); database leak does not expose valid reset tokens.
+   - Single-use: `POST /auth/reset-password` clears the token hash and expiry to `NULL`.
+2. **Non-Enumerating Constant-Time Responses**:
+   - `POST /auth/forgot-password` returns the exact same success message whether the email exists or not.
+   - `AuthService.login()` runs `bcrypt.compare` against a constant dummy hash for non-existent emails, preventing timing-based account discovery.
+3. **Stateful Session Revocation via `tokenVersion`**:
+   - Added `tokenVersion INT DEFAULT 0` to `"user"`.
+   - Included `tv: tokenVersion` in JWT payloads.
+   - `JwtStrategy.validate()` verifies `payload.tv === user.tokenVersion`.
+   - Both `resetPassword` and `changePassword` increment `tokenVersion`, instantly revoking all active JWT sessions across devices.
+4. **Case-Insensitive Email Collision Shield**:
+   - Case normalization at DTO (`@Transform`) and query layers (`LOWER(email)`).
+   - Created unique functional index in PostgreSQL: `CREATE UNIQUE INDEX idx_user_lower_email ON "user" (LOWER(email))`.
+5. **Database Migrations**:
+   - `scripts/migrate-auth-hardening.js`: added columns, normalized emails, created unique lowercase index.
+   - `scripts/migrate-notification-password-reset.js`: added `PASSWORD_RESET` to `notifications_type_enum`.
+
+### Verification
+- `scripts/test-auth-lifecycle.js`:
+  - Step 1: Lowercase registration & JWT validation on `/auth/me` (201).
+  - Step 2: Uppercase email registration collision blocked (409 Conflict).
+  - Step 3: Forgot-password non-enumeration check (identical responses for existing and non-existent accounts).
+  - Step 4: Verification of 64-character SHA-256 hash and 30-minute expiry in PostgreSQL.
+  - Step 5: Rejection of invalid and expired tokens (400 Bad Request).
+  - Step 6: Valid password reset, token cleared from DB, and replay attack blocked.
+  - Step 7: Pre-reset JWT rejected on `/auth/me` with 401 Unauthorized (`tokenVersion` mismatch).
+  - Step 8: Login with old password rejected (401), login with new password succeeds (201).
+  - Step 9: Authenticated change-password rejecting wrong current password (401), succeeding with correct password, and revoking prior JWT.
+  - 100% of tests passed.
 

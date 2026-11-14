@@ -20,7 +20,7 @@ Every engineer (human or AI agent) **must review these records** before proposin
 | [ADR 006](./006-multi-channel-notifications-engine.md) | Multi-Channel Notifications Engine & Fallback Architecture | **ACCEPTED** | 2026-11-03 |
 | [ADR 007](./007-trust-boundaries-and-failure-semantics.md) | Trust Boundaries, Failure Semantics & Output Escaping | **ACCEPTED** | 2026-11-04 |
 | [ADR 008](./008-artisan-kyc-verification-desk.md) | Artisan KYC Verification Desk, Observation Mode & Anti-Sybil Shield | **ACCEPTED** | 2026-11-05 |
-| [ADR 009](./009-security-hardening-phase1-phase2.md) | Security Hardening & Zero-Trust Defense (Phase 1 & Phase 2) | **ACCEPTED** | 2026-11-11 |
+| [ADR 009](./009-security-hardening-phase1-phase2.md) | Security Hardening & Zero-Trust Defense (Phases 1–8) | **ACCEPTED** | 2026-11-14 |
 
 ---
 

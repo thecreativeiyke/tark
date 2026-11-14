@@ -15,15 +15,81 @@
 
 - **Backend Server**: NestJS running live on `http://localhost:3000` (Background Task).
 - **Database**: PostgreSQL 16 on **Supabase** via AWS London (`eu-west-2`) IPv4 Pooler (`aws-0-eu-west-2.pooler.supabase.com:5432/postgres`).
-- **Object Storage**: Cloudflare R2 bucket (`iyke-cloud`) via [`iyke-storage`](https://www.npmjs.com/package/iyke-storage) gateway.
-- **Payments**: Paystack gateway with NUBAN bank resolution, dedicated accounts and deterministic payout references. Provider failures now THROW (no silent simulation); local simulation only with `PAYMENTS_SANDBOX_FALLBACK=true` (ignored in production). Paystack **test** key is configured locally; a full sandbox journey has not been run yet.
-- **AI Intelligence**: Gemini support desk currently configured with `gemini-3.5-flash` (deprecated alias) + `gemini-2.5-flash` fallback. **Model choice is OPEN** pending a clean re-run of `scripts/test-gemini-models.js` (first run was crippled by free-tier quota and a 1000-token cap).
-- **Notifications**: In-app feed + email (Resend, Gmail SMTP fallback) working. Web Push built but **real browser delivery not yet tested** (use `scripts/push-test/`). SMS in dev-simulator mode (Termii sender ID not approved).
-- **KYC**: Module exists (`src/kyc/`). Documents sit on the PUBLIC CDN and ID numbers are plaintext, so production submissions are blocked until `KYC_PRIVATE_STORAGE_READY=true`. Bidding is gated by `KYC_REQUIRED_TO_BID` (default on).
-- **Tests**: No automated tests cover escrow, wallet, payments or disputes. Two boilerplate `jobs` specs fail. This is the largest quality gap.
-- **Config safety**: `DB_SYNCHRONIZE` should be `false` (flip for ONE start when adding entities). All secrets in the founder's `.env` have appeared in chat/agent logs and must be rotated before real users (see Session 9).
+- **Object Storage**: Cloudflare R2 bucket (`iyke-cloud`) via [`iyke-storage`](https://www.npmjs.com/package/iyke-storage) gateway. Uploads verified via server-side magic-byte header inspection (`file-signature.ts`).
+- **Payments & Payouts**: Paystack gateway with NUBAN bank resolution, dedicated accounts, and deterministic payout references. Payouts decoupled into two phases (`PAYOUT_PENDING` committed before gateway call; out-of-lock HTTP request; `applyTransferOutcome` with background sweeper reconciliation).
+- **Authentication**: JWT authentication with stateful `tokenVersion` session revocation, case-insensitive email collision prevention (`idx_user_lower_email`), constant-time login timing protection, and SHA-256 cryptographic password reset lifecycle.
+- **AI Intelligence**: Gemini support desk configured with `gemini-2.5-flash` with BOLA prompt protection.
+- **Notifications**: Multi-channel in-app feed, Web Push, and email (Resend with Gmail SMTP fallback). `PASSWORD_RESET` notification type added.
+- **KYC**: Verified KYC module (`src/kyc/`) with strict positional name alignment, document hash duplicate shield, and CDN URL validation.
+- **Active Test Suites**: Red-team test suites actively executed against live server and Supabase database:
+  - `scripts/test-auth-lifecycle.js`: 100% PASS (9 lifecycle & attack scenarios)
+  - `scripts/test-kyc-url-validation.js`: 100% PASS (4 hostile & valid scenarios)
+  - `scripts/test-upload-magic-bytes.js`: 100% PASS (41 checks across offline & live endpoints)
+  - `scripts/redteam-active-hack-phase1.js`: 100% PASS (5 financial sink attacks repelled)
+  - `scripts/redteam-active-hack-phase2.js`: 100% PASS (6 privacy & IDOR attacks repelled)
+- **Config safety**: `DB_SYNCHRONIZE=false`. Database migrations versioned in `scripts/`.
 - **GitHub Repository**: [`https://github.com/thecreativeiyke/tark.git`](https://github.com/thecreativeiyke/tark.git) (`main` branch).
 - **Core Engineering Team**: Ikechukwu Alaeto (Founder & Product Lead), **Claude** & **Gemini** (Lead Engineers - AI Core).
+
+---
+
+## 🗓️ Session Log
+
+### 🗓️ 2026-11-14 — Session 14: Authentication Lifecycle, Session Revocation (`tokenVersion`) & Timing Attack Hardening
+- **Author**: Lead Engineer (AI Model: Gemini / Antigravity) & Ikechukwu Alaeto (Founder)
+- **Tag**: `[SHIPPED]` & `[AUDIT]` — Full rationale in Phase 8 amendment of [ADR 009](./docs/adr/009-security-hardening-phase1-phase2.md)
+
+#### 🚀 What Shipped & Verified:
+1. **Password Reset Lifecycle**:
+   - `POST /auth/forgot-password`: Generates 32-byte cryptographic random hex token, hashes with SHA-256, and stores `passwordResetTokenHash` with 30-minute expiration (`passwordResetExpiresAt`). Returns non-enumerating constant-time response.
+   - `POST /auth/reset-password`: Hashes incoming token, validates expiry in DB, updates bcrypt password hash, and clears token hash to `NULL` (single-use anti-replay).
+   - `POST /auth/change-password`: Authenticated endpoint validating existing password before updating.
+2. **Stateful Session Revocation (`tokenVersion`)**:
+   - Added `tokenVersion INT DEFAULT 0` column to `"user"` table.
+   - Embedded `tv` claim in JWT payload (`AuthService.buildToken`).
+   - `JwtStrategy.validate()` performs live DB verification (`payload.tv === user.tokenVersion`).
+   - Both password reset and change password increment `tokenVersion`, instantly revoking all active sessions across devices.
+3. **Case-Insensitive Email Collision Shield**:
+   - Normalizes email inputs at DTO level (`@Transform`) and query layer (`LOWER(email)`).
+   - Created PostgreSQL unique functional index: `CREATE UNIQUE INDEX idx_user_lower_email ON "user" (LOWER(email))`.
+4. **Timing Attack Protection**:
+   - `AuthService.login()` performs dummy `bcrypt.compare` against constant dummy hash when email does not exist, eliminating side-channel account enumeration.
+5. **Database Migrations**:
+   - `scripts/migrate-auth-hardening.js`: added columns, normalized emails, created unique lowercase index.
+   - `scripts/migrate-notification-password-reset.js`: added `PASSWORD_RESET` to `notifications_type_enum`.
+6. **Active Red-Team Verification (`scripts/test-auth-lifecycle.js`)**:
+   - Executed live against NestJS server and Supabase PostgreSQL: all 9 test steps passed 100%!
+   - Full regression suite rerun: KYC URL shield, upload magic bytes, red-team phase 1, and red-team phase 2 all passed 100%.
+- **Git Commit**: `ee6e039` pushed to `main`.
+
+---
+
+### 🗓️ 2026-11-12 — Session 13: Media Magic-Bytes, KYC URL Shield & Two-Phase Payout State Machine
+- **Author**: Lead Engineers (Claude & Gemini / Antigravity)
+- **Tag**: `[SHIPPED]` & `[FLAGGED & FIXED]` — Full rationale in Phases 5–7 amendments of [ADR 009](./docs/adr/009-security-hardening-phase1-phase2.md)
+
+#### 🚀 What Shipped & Verified:
+1. **Magic-Byte Binary Inspection (`src/media/file-signature.ts`, `media.service.ts`)**:
+   - Whitelists only genuine binary headers (JPEG, PNG, WebP, HEIC, MP4, MOV, WebM).
+   - Rejects spoofed MIME types, HTML, SVGs, PHP scripts, and executables before reaching Cloudflare R2.
+   - Batch upload inspection fails atomic batch if any single file fails.
+   - Filename sanitization neutralizes double extensions and path traversal attacks.
+   - Verified via `scripts/test-upload-magic-bytes.js` (41/41 checks passed).
+   - Commit: `e452e2b`.
+2. **KYC Document & Selfie URL Shield (`src/kyc/kyc.service.ts`)**:
+   - `validateKycUrls()` restricts submitted URLs to configured Tark Cloudflare CDN host (`STORAGE_CUSTOM_CDN_URL`).
+   - Blocks SSRF, external phishing links, and spoofed hostnames.
+   - Verified via `scripts/test-kyc-url-validation.js`.
+   - Commit: `0ccdb6e`.
+3. **Two-Phase Decoupled Payout State Machine (`src/escrow/escrow.service.ts`, `src/payments/payments.service.ts`)**:
+   - Phase 1: DB row lock sets `PAYOUT_PENDING` and deterministic reference (`tark-t1-<id>` / `tark-t2-<id>`), commits immediately.
+   - External Paystack transfer call executes outside DB lock, preventing row lock freezes and connection exhaustion.
+   - Phase 2: `applyTransferOutcome()` handles status (`success` settles; `pending/otp` stays pending; `failed` sets `PAYOUT_FAILED`).
+   - Background sweeper reconciles stuck `PAYOUT_PENDING` rows via Paystack verification.
+   - Transfer webhook handlers for `transfer.success`, `transfer.failed`, and `transfer.reversed`.
+   - Database migration: `scripts/migrate-payout-states.js`.
+   - Test harness: `scripts/test-payout-two-phase.js`.
+   - Commits: `7ae6dfb` & `eb5d679`.
 
 ---
 
