@@ -21,6 +21,7 @@ export enum NotificationType {
   KYC_SUBMITTED = 'KYC_SUBMITTED',
   KYC_APPROVED = 'KYC_APPROVED',
   KYC_REJECTED = 'KYC_REJECTED',
+  PASSWORD_RESET = 'PASSWORD_RESET',
 }
 
 @Entity({ name: 'notifications' })

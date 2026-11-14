@@ -18,15 +18,17 @@ export class UsersService {
   ) {}
 
   async create(registerDto: RegisterDto) {
-    const existing = await this.usersRepository.findOneBy({
-      email: registerDto.email,
-    });
+    const normalizedEmail = registerDto.email.trim().toLowerCase();
+    const existing = await this.usersRepository
+      .createQueryBuilder('user')
+      .where('LOWER(user.email) = :email', { email: normalizedEmail })
+      .getOne();
     if (existing) {
       throw new ConflictException('Email already registered');
     }
     const hashedPassword = await bcrypt.hash(registerDto.password, 10);
     const user = this.usersRepository.create({
-      email: registerDto.email,
+      email: normalizedEmail,
       password: hashedPassword,
       fullName: registerDto.fullName,
       // Never copy a role from the request beyond the two public roles.
@@ -37,15 +39,66 @@ export class UsersService {
   }
 
   findByEmail(email: string) {
+    const normalizedEmail = (email || '').trim().toLowerCase();
     return this.usersRepository
       .createQueryBuilder('user')
       .addSelect('user.password')
-      .where('LOWER(user.email) = LOWER(:email)', { email })
+      .addSelect('user.passwordResetTokenHash')
+      .addSelect('user.passwordResetExpiresAt')
+      .where('LOWER(user.email) = :email', { email: normalizedEmail })
       .getOne();
   }
 
   findOne(id: string) {
     return this.usersRepository.findOneBy({ id });
+  }
+
+  /** Find user by their stored (hashed) reset token — must select hidden fields */
+  findByPasswordResetTokenHash(hash: string): Promise<User | null> {
+    return this.usersRepository
+      .createQueryBuilder('user')
+      .addSelect('user.passwordResetTokenHash')
+      .addSelect('user.passwordResetExpiresAt')
+      .where('user.passwordResetTokenHash = :hash', { hash })
+      .getOne();
+  }
+
+  async setPasswordResetToken(
+    userId: string,
+    tokenHash: string,
+    expiresAt: Date,
+  ): Promise<void> {
+    await this.usersRepository.update(userId, {
+      passwordResetTokenHash: tokenHash,
+      passwordResetExpiresAt: expiresAt,
+    });
+  }
+
+  async clearPasswordResetToken(userId: string): Promise<void> {
+    await this.usersRepository.update(userId, {
+      passwordResetTokenHash: null as unknown as string,
+      passwordResetExpiresAt: null as unknown as Date,
+    });
+  }
+
+  async updatePassword(userId: string, hashedPassword: string): Promise<void> {
+    await this.usersRepository.update(userId, { password: hashedPassword });
+  }
+
+  async incrementTokenVersion(userId: string): Promise<void> {
+    await this.usersRepository.increment({ id: userId }, 'tokenVersion', 1);
+  }
+
+  /**
+   * Load a user with their password hash selected (needed for changePassword).
+   * Returns null if not found.
+   */
+  findOneWithPassword(id: string): Promise<User | null> {
+    return this.usersRepository
+      .createQueryBuilder('user')
+      .addSelect('user.password')
+      .where('user.id = :id', { id })
+      .getOne();
   }
 
   async updateProfile(userId: string, dto: UpdateProfileDto) {

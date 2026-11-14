@@ -118,6 +118,15 @@ export class User {
   @Column({ nullable: true })
   payoutRecipientCode: string; // External gateway recipient identifier (e.g. RCP_...)
 
+  @Column({ default: 0 })
+  tokenVersion: number;
+
+  @Column({ nullable: true, select: false })
+  passwordResetTokenHash: string;
+
+  @Column({ type: 'timestamptz', nullable: true, select: false })
+  passwordResetExpiresAt: Date;
+
   @CreateDateColumn()
   createdAt: Date;
 

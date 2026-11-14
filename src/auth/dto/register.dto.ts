@@ -1,7 +1,9 @@
 import { IsEmail, IsString, MinLength, IsIn, IsOptional } from 'class-validator';
+import { Transform } from 'class-transformer';
 import { UserRole } from '../../users/entities/user.entity';
 
 export class RegisterDto {
+  @Transform(({ value }) => (typeof value === 'string' ? value.trim().toLowerCase() : value))
   @IsEmail()
   email: string;
 
