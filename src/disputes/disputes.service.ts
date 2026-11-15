@@ -9,7 +9,7 @@ import { InjectRepository, InjectDataSource } from '@nestjs/typeorm';
 import { Repository, DataSource } from 'typeorm';
 import {
   Dispute,
-  DisputeCategory,
+  DisputePayoutStatus,
   DisputeStatus,
   DisputeVerdict,
 } from './entities/dispute.entity';
@@ -24,7 +24,8 @@ import {
 } from '../escrow/entities/escrow-transaction.entity';
 import { Job, JobStatus } from '../jobs/entities/job.entity';
 import { User, UserRole } from '../users/entities/user.entity';
-import { PaymentsService } from '../payments/payments.service';
+import { EscrowService } from '../escrow/escrow.service';
+import type { DisputePayoutDispatch } from '../escrow/escrow.service';
 import { WalletLedger, WalletLedgerType } from '../payments/entities/wallet-ledger.entity';
 import { NotificationsService } from '../notifications/notifications.service';
 
@@ -43,7 +44,7 @@ export class DisputesService {
     private usersRepository: Repository<User>,
     @InjectDataSource()
     private dataSource: DataSource,
-    private paymentsService: PaymentsService,
+    private escrowService: EscrowService,
     private notificationsService: NotificationsService,
   ) {}
 
@@ -52,56 +53,64 @@ export class DisputesService {
   // Freezes the escrow and starts the 48-hour counter-response window
   // ─────────────────────────────────────────────────────────────────────
   async create(dto: CreateDisputeDto, initiatorId: string) {
-    const escrow = await this.escrowRepository.findOneBy({ id: dto.escrowId });
-    if (!escrow) {
-      throw new NotFoundException('Escrow transaction not found');
-    }
-
-    if (escrow.clientId !== initiatorId && escrow.artisanId !== initiatorId) {
-      throw new ForbiddenException('You are not a party to this escrow agreement');
-    }
-
-    if (escrow.totalStatus === EscrowStatus.INITIATED) {
-      throw new BadRequestException('Cannot raise a dispute on an unfunded escrow');
-    }
-
-    if (escrow.totalStatus === EscrowStatus.SETTLED) {
-      throw new BadRequestException('Cannot raise a dispute on a completed and settled escrow');
-    }
-
-    // Check for existing active dispute
-    const existing = await this.disputesRepository.findOne({
-      where: [
-        { escrowId: escrow.id, status: DisputeStatus.OPEN },
-        { escrowId: escrow.id, status: DisputeStatus.AWAITING_REVIEW },
-        { escrowId: escrow.id, status: DisputeStatus.UNDER_INVESTIGATION },
-      ],
-    });
-
-    if (existing) {
-      throw new BadRequestException('An active dispute is already open for this escrow transaction');
-    }
-
-    const defendantId = initiatorId === escrow.clientId ? escrow.artisanId : escrow.clientId;
-    if (!defendantId) {
-      throw new BadRequestException('Cannot determine opposing party on this escrow');
-    }
-
     return this.dataSource.transaction(async (manager) => {
-      // Pessimistic lock on escrow to prevent race conditions with handshake verification
+      // Pessimistic lock on escrow to prevent race conditions with handshake verification,
+      // in-flight payout dispatch, or concurrent duplicate dispute creations
       const lockedEscrow = await manager
         .getRepository(EscrowTransaction)
         .createQueryBuilder('escrow')
         .setLock('pessimistic_write')
-        .where('escrow.id = :id', { id: escrow.id })
+        .where('escrow.id = :id', { id: dto.escrowId })
         .getOne();
 
       if (!lockedEscrow) {
-        throw new NotFoundException('Associated escrow not found');
+        throw new NotFoundException('Escrow transaction not found');
+      }
+
+      if (lockedEscrow.clientId !== initiatorId && lockedEscrow.artisanId !== initiatorId) {
+        throw new ForbiddenException('You are not a party to this escrow agreement');
+      }
+
+      if (lockedEscrow.totalStatus === EscrowStatus.INITIATED) {
+        throw new BadRequestException('Cannot raise a dispute on an unfunded escrow');
       }
 
       if (lockedEscrow.totalStatus === EscrowStatus.SETTLED) {
         throw new BadRequestException('Cannot raise a dispute on a completed and settled escrow');
+      }
+
+      if (lockedEscrow.totalStatus === EscrowStatus.DISPUTED) {
+        throw new BadRequestException('An active dispute is already open for this escrow transaction');
+      }
+
+      // If a payout transfer is currently in flight at the bank gateway, opening a dispute
+      // would create an unresolvable collision if the webhook later confirms or fails.
+      if (
+        lockedEscrow.tranche1Status === TrancheStatus.PAYOUT_PENDING ||
+        lockedEscrow.tranche2Status === TrancheStatus.PAYOUT_PENDING
+      ) {
+        throw new BadRequestException(
+          'A payout transfer is currently in-flight with the payment provider. ' +
+          'Please allow a few minutes for the transfer to settle or fail before raising a dispute.',
+        );
+      }
+
+      // Check for existing active dispute under this lock
+      const existing = await manager.findOne(Dispute, {
+        where: [
+          { escrowId: lockedEscrow.id, status: DisputeStatus.OPEN },
+          { escrowId: lockedEscrow.id, status: DisputeStatus.AWAITING_REVIEW },
+          { escrowId: lockedEscrow.id, status: DisputeStatus.UNDER_INVESTIGATION },
+        ],
+      });
+
+      if (existing) {
+        throw new BadRequestException('An active dispute is already open for this escrow transaction');
+      }
+
+      const defendantId = initiatorId === lockedEscrow.clientId ? lockedEscrow.artisanId : lockedEscrow.clientId;
+      if (!defendantId) {
+        throw new BadRequestException('Cannot determine opposing party on this escrow');
       }
 
       // Freeze escrow state
@@ -204,18 +213,31 @@ export class DisputesService {
   // 4. ADMIN ASSIGNMENT / DEPARTMENT TRANSFER
   // ─────────────────────────────────────────────────────────────────────
   async assign(disputeId: string, dto: AssignDisputeDto) {
-    const dispute = await this.disputesRepository.findOneBy({ id: disputeId });
-    if (!dispute) {
-      throw new NotFoundException('Dispute ticket not found');
-    }
+    // Row lock + status guard in one transaction: a verdict that commits first can never be
+    // reopened by a racing assignment.
+    return this.dataSource.transaction(async (manager) => {
+      const dispute = await manager.findOne(Dispute, {
+        where: { id: disputeId },
+        lock: { mode: 'pessimistic_write' },
+      });
+      if (!dispute) {
+        throw new NotFoundException('Dispute ticket not found');
+      }
 
-    dispute.assignedAdminId = dto.adminId;
-    if (dto.department) {
-      dispute.adminDepartment = dto.department;
-    }
-    dispute.status = DisputeStatus.UNDER_INVESTIGATION;
+      if (dispute.status === DisputeStatus.RESOLVED || dispute.status === DisputeStatus.DISMISSED) {
+        throw new BadRequestException(
+          `Cannot reassign a dispute that is already ${dispute.status}`,
+        );
+      }
 
-    return this.disputesRepository.save(dispute);
+      dispute.assignedAdminId = dto.adminId;
+      if (dto.department) {
+        dispute.adminDepartment = dto.department;
+      }
+      dispute.status = DisputeStatus.UNDER_INVESTIGATION;
+
+      return manager.save(Dispute, dispute);
+    });
   }
 
   // ─────────────────────────────────────────────────────────────────────
@@ -271,7 +293,8 @@ export class DisputesService {
   // ─────────────────────────────────────────────────────────────────────
   // 6. RESOLVE DISPUTE: Authoritative binding verdict
   // - Client refunds are credited instantly into their in-app wallet.
-  // - Artisan payouts are disbursed via Paystack transfer.
+  // - Artisan payouts are two-phase: PAYOUT_PENDING + reference commit with the verdict, the provider
+  //   transfer is dispatched after commit, and RELEASED is only recorded once the provider confirms.
   // - Platform service fee is non-refundable.
   // - All database updates execute inside an atomic transaction.
   // ─────────────────────────────────────────────────────────────────────
@@ -307,7 +330,7 @@ export class DisputesService {
     }
 
     // Execute financial execution and database mutations in an atomic transaction
-    return this.dataSource.transaction(async (manager) => {
+    const result = await this.dataSource.transaction(async (manager) => {
       // Lock escrow row to prevent double-settlement and concurrent modifications
       const lockedEscrow = await manager
         .getRepository(EscrowTransaction)
@@ -388,6 +411,19 @@ export class DisputesService {
         throw new BadRequestException('Cannot pay out: no artisan is assigned to this escrow');
       }
 
+      if (artisanPayoutMinor > 0 && artisan && !artisan.payoutRecipientCode) {
+        throw new BadRequestException(
+          `Cannot execute verdict: Artisan has no registered payout recipient code. ` +
+          `Please have them provide bank details before releasing funds.`,
+        );
+      }
+
+      if (clientRefundMinor > 0 && escrow.currency !== 'NGN') {
+        throw new BadRequestException(
+          `Cannot credit wallet in ${escrow.currency}. In-app wallet refunds are supported in NGN only.`,
+        );
+      }
+
       const clientRefund = clientRefundMinor / 100;
       const artisanPayout = artisanPayoutMinor / 100;
       const feeRetained = feeMinor / 100;
@@ -423,47 +459,30 @@ export class DisputesService {
         this.logger.log(`Dispute Refund: ₦${clientRefund} credited to Client (${client.id}) wallet`);
       }
 
-      // 2. Disburse to Artisan via Paystack transfer if payout is due
-      if (artisanPayout > 0 && artisan) {
-        if (!artisan.payoutRecipientCode) {
-          throw new BadRequestException(
-            `Cannot execute verdict: Artisan has no registered payout recipient code. ` +
-            `Please have them provide bank details before releasing funds.`,
-          );
-        }
-
-        const amountKobo = Math.round(artisanPayout * 100);
-        const disputePayoutRef = `tark-dispute-${dispute.id}`;
-
-        await this.paymentsService.initiateTransfer(
-          amountKobo,
-          artisan.payoutRecipientCode,
-          `Tark Dispute Settlement: Job #${escrow.jobId.slice(0, 8)}`,
-          escrow.currency,
-          disputePayoutRef,
-        );
-      }
-
-      // 3. Update Escrow status
+      // 2. Update Escrow status (Preserve already RELEASED tranches so previously paid funds aren't falsely labelled REFUNDED)
       lockedEscrow.totalStatus = EscrowStatus.SETTLED;
       lockedEscrow.feeCollectedMinor = feeMinor;
       if (clientRefund > 0 && artisanPayout === 0) {
-        lockedEscrow.tranche1Status = TrancheStatus.REFUNDED;
-        lockedEscrow.tranche2Status = TrancheStatus.REFUNDED;
+        if (lockedEscrow.tranche1Status !== TrancheStatus.RELEASED) {
+          lockedEscrow.tranche1Status = TrancheStatus.REFUNDED;
+        }
+        if (lockedEscrow.tranche2Status !== TrancheStatus.RELEASED) {
+          lockedEscrow.tranche2Status = TrancheStatus.REFUNDED;
+        }
       } else {
         lockedEscrow.tranche1Status = TrancheStatus.RELEASED;
         lockedEscrow.tranche2Status = TrancheStatus.RELEASED;
       }
       await manager.save(EscrowTransaction, lockedEscrow);
 
-      // 4. Update Job status
+      // 3. Update Job status
       const finalJobStatus =
         dto.verdict === DisputeVerdict.FULL_PAYOUT_TO_ARTISAN
           ? JobStatus.COMPLETED
           : JobStatus.CANCELLED;
       await manager.update(Job, escrow.jobId, { status: finalJobStatus });
 
-      // 5. Update Dispute Record
+      // 4. Update Dispute Record
       dispute.verdict = dto.verdict;
       dispute.clientRefundAmount = clientRefund;
       dispute.artisanPayoutAmount = artisanPayout;
@@ -471,53 +490,127 @@ export class DisputesService {
       dispute.resolvedAt = new Date();
       dispute.status = DisputeStatus.RESOLVED;
       dispute.assignedAdminId = adminId;
-      await manager.save(Dispute, dispute);
 
-      // Notify both parties of official verdict
-      Promise.all([
-        this.usersRepository.findOne({ where: { id: client.id } }),
-        artisan ? this.usersRepository.findOne({ where: { id: artisan.id } }) : null,
-      ])
-        .then(([cUser, aUser]) => {
-          if (cUser) {
-            this.notificationsService
-              .notifyDisputeUpdate({
-                userId: cUser.id,
-                userName: cUser.fullName,
-                jobTitle: job?.title || 'Service Job',
-                disputeReason: dispute.claimStatement,
-                status: `RESOLVED: ${dto.verdict}`,
-                resolutionNotes: dto.resolutionNotes,
-                disputeId: dispute.id,
-              })
-              .catch(() => {});
-          }
-          if (aUser) {
-            this.notificationsService
-              .notifyDisputeUpdate({
-                userId: aUser.id,
-                userName: aUser.fullName,
-                jobTitle: job?.title || 'Service Job',
-                disputeReason: dispute.claimStatement,
-                status: `RESOLVED: ${dto.verdict}`,
-                resolutionNotes: dto.resolutionNotes,
-                disputeId: dispute.id,
-              })
-              .catch(() => {});
-          }
-        })
-        .catch((err) => this.logger.error(`Dispute verdict notice error: ${err.message}`));
+      // Phase 1 of the artisan payout: commit PAYOUT_PENDING + the deterministic reference with the
+      // verdict, BEFORE the provider is contacted. A crash or timeout after this point leaves a
+      // pending record that a webhook or the reconciliation sweep can resolve.
+      let payoutDispatch: DisputePayoutDispatch | null = null;
+      if (artisanPayoutMinor > 0 && artisan?.payoutRecipientCode) {
+        const reference = `tark-dispute-${dispute.id}`;
+        dispute.payoutStatus = DisputePayoutStatus.PAYOUT_PENDING;
+        dispute.payoutReference = reference;
+        dispute.payoutDispatchedAt = null;
+        payoutDispatch = {
+          disputeId: dispute.id,
+          escrowId: lockedEscrow.id,
+          amountMinor: artisanPayoutMinor,
+          recipientCode: artisan.payoutRecipientCode,
+          reference,
+          reason: `Tark Dispute Settlement: Job #${escrow.jobId.slice(0, 8)}`,
+          currency: escrow.currency,
+        };
+      } else {
+        dispute.payoutStatus = DisputePayoutStatus.NOT_REQUIRED;
+      }
+
+      const savedDispute = await manager.save(Dispute, dispute);
 
       return {
-        message: `Dispute resolved successfully with verdict: ${dto.verdict}`,
-        dispute,
-        disbursement: {
-          clientRefundedToWallet: clientRefund,
-          artisanDisbursedToBank: artisanPayout,
-          platformServiceFeeRetained: feeRetained > 0,
-          platformFeeRetainedAmount: feeRetained,
-        },
+        savedDispute,
+        payoutDispatch,
+        artisanPayout,
+        clientRefund,
+        feeRetained,
+        disputeId: dispute.id,
       };
     });
+
+    // ─────────────────────────────────────────────────────────────────
+    // Phase 2: provider call AFTER the verdict transaction has committed.
+    // The result only ever moves the payout to RELEASED on provider confirmation. Ambiguous outcomes
+    // (timeout, 5xx, 'pending', 'otp') stay PAYOUT_PENDING for the webhook / reconciliation sweep.
+    // ─────────────────────────────────────────────────────────────────
+    let payoutStatus = result.payoutDispatch
+      ? DisputePayoutStatus.PAYOUT_PENDING
+      : DisputePayoutStatus.NOT_REQUIRED;
+    if (result.payoutDispatch) {
+      try {
+        payoutStatus = await this.escrowService.dispatchDisputePayout(result.payoutDispatch);
+      } catch (err: any) {
+        this.logger.error(
+          `Dispute #${result.disputeId} payout dispatch threw (${result.payoutDispatch.reference}): ${err.message}. ` +
+            'Verdict is committed and the payout stays PAYOUT_PENDING for reconciliation.',
+          err.stack,
+        );
+      }
+    }
+
+    const finalDispute =
+      (await this.disputesRepository.findOneBy({ id: result.disputeId })) ?? result.savedDispute;
+
+    // Notify both parties of official verdict
+    Promise.all([
+      this.usersRepository.findOne({ where: { id: client.id } }),
+      artisan ? this.usersRepository.findOne({ where: { id: artisan.id } }) : null,
+    ])
+      .then(([cUser, aUser]) => {
+        if (cUser) {
+          this.notificationsService
+            .notifyDisputeUpdate({
+              userId: cUser.id,
+              userName: cUser.fullName,
+              jobTitle: job?.title || 'Service Job',
+              disputeReason: dispute.claimStatement,
+              status: `RESOLVED: ${dto.verdict}`,
+              resolutionNotes: dto.resolutionNotes,
+              disputeId: dispute.id,
+            })
+            .catch(() => {});
+        }
+        if (aUser) {
+          this.notificationsService
+            .notifyDisputeUpdate({
+              userId: aUser.id,
+              userName: aUser.fullName,
+              jobTitle: job?.title || 'Service Job',
+              disputeReason: dispute.claimStatement,
+              status: `RESOLVED: ${dto.verdict}`,
+              resolutionNotes: dto.resolutionNotes,
+              disputeId: dispute.id,
+            })
+            .catch(() => {});
+        }
+      })
+      .catch((err) => this.logger.error(`Dispute verdict notice error: ${err.message}`));
+
+    let payoutNote = '';
+    if (payoutStatus === DisputePayoutStatus.PAYOUT_PENDING) {
+      payoutNote = ' The artisan payout is awaiting provider confirmation.';
+    } else if (payoutStatus === DisputePayoutStatus.PAYOUT_FAILED) {
+      payoutNote = ' The artisan payout failed at the provider; use PATCH /disputes/:id/retry-payout.';
+    }
+
+    return {
+      message: `Dispute resolved successfully with verdict: ${dto.verdict}.${payoutNote}`,
+      dispute: finalDispute,
+      disbursement: {
+        clientRefundedToWallet: result.clientRefund,
+        artisanPayoutAmount: result.artisanPayout,
+        artisanPayoutStatus: payoutStatus,
+        // Only money the provider has confirmed counts as disbursed.
+        artisanDisbursedToBank:
+          payoutStatus === DisputePayoutStatus.RELEASED ? result.artisanPayout : 0,
+        platformServiceFeeRetained: result.feeRetained > 0,
+        platformFeeRetainedAmount: result.feeRetained,
+      },
+    };
+  }
+
+  // ─────────────────────────────────────────────────────────────────────
+  // 7. RETRY ARTISAN PAYOUT: admin re-dispatches a dispute payout that conclusively FAILED.
+  // Uses a fresh provider reference and refuses to run while the old transfer might still be live.
+  // ─────────────────────────────────────────────────────────────────────
+  async retryPayout(disputeId: string) {
+    return this.escrowService.retryDisputePayout(disputeId);
   }
 }

@@ -1,4 +1,4 @@
-import { IsEmail, IsString, MinLength, IsIn, IsOptional } from 'class-validator';
+import { IsEmail, IsString, MinLength, MaxLength, IsIn, IsOptional } from 'class-validator';
 import { Transform } from 'class-transformer';
 import { UserRole } from '../../users/entities/user.entity';
 
@@ -9,6 +9,7 @@ export class RegisterDto {
 
   @IsString()
   @MinLength(8)
+  @MaxLength(72, { message: 'Password must not exceed 72 characters' })
   password: string;
 
   @IsString()

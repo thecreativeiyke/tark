@@ -25,6 +25,15 @@ export enum DisputeStatus {
   DISMISSED = 'DISMISSED', // Voluntarily withdrawn or dismissed
 }
 
+// Mirrors TrancheStatus naming: PAYOUT_PENDING is committed BEFORE the provider is contacted and is
+// only moved to RELEASED once the provider confirms the transfer succeeded.
+export enum DisputePayoutStatus {
+  NOT_REQUIRED = 'NOT_REQUIRED', // verdict sends nothing to the artisan
+  PAYOUT_PENDING = 'PAYOUT_PENDING',
+  RELEASED = 'RELEASED',
+  PAYOUT_FAILED = 'PAYOUT_FAILED', // retryable via admin retry-payout
+}
+
 export enum DisputeVerdict {
   FULL_REFUND_TO_CLIENT = 'FULL_REFUND_TO_CLIENT',
   FULL_PAYOUT_TO_ARTISAN = 'FULL_PAYOUT_TO_ARTISAN',
@@ -33,6 +42,9 @@ export enum DisputeVerdict {
 }
 
 @Entity()
+@Index('IDX_dispute_payout_pending', ['payoutStatus'], {
+  where: `"payoutStatus" = 'PAYOUT_PENDING'`,
+})
 export class Dispute {
   @PrimaryGeneratedColumn('uuid')
   id: string;
@@ -111,6 +123,23 @@ export class Dispute {
 
   @Column({ type: 'timestamp', nullable: true })
   resolvedAt: Date | null;
+
+  // Artisan payout tracking. Set inside the verdict transaction, before any provider call.
+  @Column({
+    type: 'enum',
+    enum: DisputePayoutStatus,
+    default: DisputePayoutStatus.NOT_REQUIRED,
+  })
+  payoutStatus: DisputePayoutStatus;
+
+  // tark-dispute-<id>, then tark-dispute-<id>-r1, -r2 ... (provider references are single-use)
+  @Index('UQ_dispute_payoutReference', { unique: true })
+  @Column({ type: 'varchar', nullable: true })
+  payoutReference: string | null;
+
+  // When we last contacted the provider for this payout
+  @Column({ type: 'timestamptz', nullable: true })
+  payoutDispatchedAt: Date | null;
 
   @CreateDateColumn()
   createdAt: Date;

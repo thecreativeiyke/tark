@@ -9,6 +9,7 @@ import * as bcrypt from 'bcryptjs';
 import { User, UserRole } from './entities/user.entity';
 import { RegisterDto } from '../auth/dto/register.dto';
 import { UpdateProfileDto } from './dto/update-profile.dto';
+import { DISTANCE_BANDS, toDistanceBand } from './distance-band.util';
 
 @Injectable()
 export class UsersService {
@@ -35,7 +36,14 @@ export class UsersService {
       role:
         registerDto.role === UserRole.ARTISAN ? UserRole.ARTISAN : UserRole.CLIENT,
     });
-    return this.usersRepository.save(user);
+    try {
+      return await this.usersRepository.save(user);
+    } catch (err: any) {
+      if (err.code === '23505') {
+        throw new ConflictException('Email already registered');
+      }
+      throw err;
+    }
   }
 
   findByEmail(email: string) {
@@ -87,6 +95,31 @@ export class UsersService {
 
   async incrementTokenVersion(userId: string): Promise<void> {
     await this.usersRepository.increment({ id: userId }, 'tokenVersion', 1);
+  }
+
+  /**
+   * Atomically resets a user's password using the token hash.
+   * Updates password, clears reset token & expiry, and increments tokenVersion in a SINGLE query.
+   * Returns true if a row was updated (meaning valid, unexpired token), false otherwise.
+   */
+  async resetPasswordAtomic(
+    tokenHash: string,
+    hashedPassword: string,
+  ): Promise<boolean> {
+    const result = await this.usersRepository
+      .createQueryBuilder()
+      .update(User)
+      .set({
+        password: hashedPassword,
+        passwordResetTokenHash: null as unknown as string,
+        passwordResetExpiresAt: null as unknown as Date,
+        tokenVersion: () => '"tokenVersion" + 1',
+      })
+      .where('"passwordResetTokenHash" = :tokenHash', { tokenHash })
+      .andWhere('"passwordResetExpiresAt" > :now', { now: new Date() })
+      .execute();
+
+    return (result.affected ?? 0) > 0;
   }
 
   /**
@@ -149,8 +182,13 @@ export class UsersService {
       .andWhere('user.longitude IS NOT NULL')
       .setParameters({ lat, lng, radiusKm: effectiveRadius });
 
-    if (category) {
-      qb.andWhere(':category = ANY(user.skills)', { category });
+    // Match ADMIN-VERIFIED categories only. `skills` is self-editable, so filtering on it
+    // would let an unverified artisan tag themselves into a regulated trade.
+    const wantedCategory = category?.trim().toLowerCase();
+    if (wantedCategory) {
+      qb.andWhere(':category = ANY(user.verifiedCategories)', {
+        category: wantedCategory,
+      });
     }
 
     qb.andWhere(
@@ -161,19 +199,29 @@ export class UsersService {
           sin(radians(:lat)) * sin(radians(user.latitude))
         ))
       )) <= :radiusKm`,
-    ).orderBy('distance', 'ASC');
+    );
 
     const rawAndEntities = await qb.getRawAndEntities();
 
-    // Return sanitized artisan profile with coarse rounded distance
-    return rawAndEntities.entities.map((user, index) => ({
-      id: user.id,
-      fullName: user.fullName,
-      role: user.role,
-      skills: user.skills,
-      isCertifiedByTark: user.isCertifiedByTark,
-      createdAt: user.createdAt,
-      distanceKm: Math.round(Number(rawAndEntities.raw[index].distance) * 10) / 10,
-    }));
+    // Order by band, then id: ordering by exact distance would leak the ranking inside a band.
+    return rawAndEntities.entities
+      .map((user, index) => ({
+        user,
+        band: toDistanceBand(Number(rawAndEntities.raw[index].distance)),
+      }))
+      .sort(
+        (a, b) =>
+          DISTANCE_BANDS.indexOf(a.band) - DISTANCE_BANDS.indexOf(b.band) ||
+          a.user.id.localeCompare(b.user.id),
+      )
+      .map(({ user, band }) => ({
+        id: user.id,
+        fullName: user.fullName,
+        role: user.role,
+        skills: user.skills,
+        isCertifiedByTark: user.isCertifiedByTark,
+        createdAt: user.createdAt,
+        distanceBand: band,
+      }));
   }
 }

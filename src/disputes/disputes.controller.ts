@@ -94,4 +94,12 @@ export class DisputesController {
   ) {
     return this.disputesService.resolve(id, dto, req.user.userId);
   }
+
+  // 7. Admin: Retry an artisan payout that failed at the provider (fresh reference, never pays twice)
+  @UseGuards(RolesGuard)
+  @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
+  @Patch(':id/retry-payout')
+  retryPayout(@Param('id') id: string) {
+    return this.disputesService.retryPayout(id);
+  }
 }

@@ -1,4 +1,4 @@
-import { IsEmail, IsString } from 'class-validator';
+import { IsEmail, IsString, MaxLength } from 'class-validator';
 import { Transform } from 'class-transformer';
 
 export class LoginDto {
@@ -7,5 +7,6 @@ export class LoginDto {
   email: string;
 
   @IsString()
+  @MaxLength(72, { message: 'Password must not exceed 72 characters' })
   password: string;
 }

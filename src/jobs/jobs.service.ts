@@ -5,19 +5,35 @@ import {
   BadRequestException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { Repository, SelectQueryBuilder } from 'typeorm';
 import { Job, JobStatus } from './entities/job.entity';
 import { CreateJobDto } from './dto/create-job.dto';
 import { UpdateJobDto } from './dto/update-job.dto';
 import { QueryJobDto } from './dto/query-job.dto';
+import { QueryMyJobsDto } from './dto/query-my-jobs.dto';
 import { CategoriesService } from '../categories/categories.service';
-import { UserRole } from '../users/entities/user.entity';
+import { User, UserRole } from '../users/entities/user.entity';
+import {
+  coarseLocation,
+  decodeCursor,
+  deriveAreaCodeFromLocation,
+  encodeCursor,
+  escapeLike,
+  toBudgetTier,
+  truncate,
+} from './jobs.utils';
+
+const DISCOVERY_DESCRIPTION_MAX = 200;
+const TEASER_TITLE_MAX = 40;
+const TEASER_LIMIT = 10;
 
 @Injectable()
 export class JobsService {
   constructor(
     @InjectRepository(Job)
     private jobsRepository: Repository<Job>,
+    @InjectRepository(User)
+    private usersRepository: Repository<User>,
     private categoriesService: CategoriesService,
   ) {}
 
@@ -32,91 +48,206 @@ export class JobsService {
     const job = this.jobsRepository.create({
       ...createJobDto,
       category: category.slug, // Normalized canonical slug
+      areaCode: deriveAreaCodeFromLocation(createJobDto.location),
       clientId,
       status: JobStatus.OPEN,
     });
     return this.jobsRepository.save(job);
   }
 
-  async findAll(query: QueryJobDto = {}, caller?: { userId?: string; role?: string }) {
-    const { page = 1, limit = 20, category, status, search } = query;
-    const skip = (page - 1) * limit;
+  // ───────────────────────── Keyset pagination ─────────────────────────
 
-    const qb = this.jobsRepository
-      .createQueryBuilder('job')
-      .where('job.deletedAt IS NULL');
+  /**
+   * Orders by (createdAt DESC, id DESC) and fetches limit + 1 rows to compute hasMore
+   * without COUNT(*). The cursor carries createdAt as Postgres text to keep microseconds.
+   */
+  private async runKeyset(qb: SelectQueryBuilder<Job>, limit: number, cursor?: string) {
+    qb.addSelect('CAST(job.createdAt AS text)', 'cursor_ts');
 
-    if (category) {
-      qb.andWhere('LOWER(job.category) = LOWER(:category)', { category });
-    }
-
-    if (status) {
-      qb.andWhere('job.status = :status', { status });
-    }
-
-    if (search && search.trim().length > 0) {
-      // Location is deliberately NOT searchable here: a LIKE on the private address lets
-      // anonymous callers probe for exact streets one guess at a time.
+    if (cursor) {
+      const c = decodeCursor(cursor);
       qb.andWhere(
-        '(LOWER(job.title) LIKE LOWER(:search) OR LOWER(job.description) LIKE LOWER(:search))',
-        { search: `%${search.trim()}%` },
+        '("job"."createdAt", "job"."id") < (CAST(:curTs AS timestamp), CAST(:curId AS uuid))',
+        { curTs: c.ts, curId: c.id },
       );
     }
 
-    qb.orderBy('job.createdAt', 'DESC')
-      .skip(skip)
-      .take(limit);
+    qb.orderBy('job.createdAt', 'DESC').addOrderBy('job.id', 'DESC').limit(limit + 1);
 
-    const [items, total] = await qb.getManyAndCount();
+    const { entities, raw } = await qb.getRawAndEntities();
+    const hasMore = entities.length > limit;
+    const items = entities.slice(0, limit);
+    const last = items[items.length - 1];
+    const nextCursor =
+      hasMore && last
+        ? encodeCursor({ ts: raw[items.length - 1].cursor_ts, id: last.id })
+        : null;
 
-    return {
-      data: items.map((job) => this.coarsenJob(job, caller)),
-      meta: {
-        total,
-        page,
-        limit,
-        totalPages: Math.ceil(total / limit),
+    return { items, meta: { limit, hasMore, nextCursor } };
+  }
+
+  // ───────────────────────── GET /jobs/me ─────────────────────────
+
+  async findMine(userId: string, query: QueryMyJobsDto = {}) {
+    const limit = query.limit ?? 20;
+
+    const qb = this.jobsRepository
+      .createQueryBuilder('job')
+      .where('job.deletedAt IS NULL')
+      .andWhere('(job.clientId = :userId OR job.artisanId = :userId)', { userId });
+
+    const { items, meta } = await this.runKeyset(qb, limit, query.cursor);
+    return { data: items.map((job) => this.toPartyView(job, userId)), meta };
+  }
+
+  // ───────────────────────── GET /jobs (artisan discovery) ─────────────────────────
+
+  async findDiscoverable(query: QueryJobDto = {}, userId: string) {
+    const artisan = await this.usersRepository.findOne({
+      where: { id: userId },
+      select: {
+        id: true,
+        role: true,
+        isCertifiedByTark: true,
+        verifiedCategories: true,
+        areaCode: true,
       },
+    });
+    if (!artisan || artisan.role !== UserRole.ARTISAN || !artisan.isCertifiedByTark) {
+      throw new ForbiddenException('Only verified artisans can browse open jobs.');
+    }
+
+    const limit = query.limit ?? 20;
+    const empty = { data: [], meta: { limit, hasMore: false, nextCursor: null } };
+
+    let categories = artisan.verifiedCategories ?? [];
+    if (!categories.length || !artisan.areaCode) return empty;
+
+    if (query.category) {
+      const wanted = query.category.trim().toLowerCase();
+      if (!categories.includes(wanted)) return empty;
+      categories = [wanted];
+    }
+
+    const qb = this.jobsRepository
+      .createQueryBuilder('job')
+      .where('job.deletedAt IS NULL')
+      .andWhere('job.status = :status', { status: JobStatus.OPEN })
+      .andWhere('job.category IN (:...categories)', { categories })
+      .andWhere('job.areaCode = :areaCode', { areaCode: artisan.areaCode });
+
+    // Title only: the description and private address are never searchable.
+    const search = query.search?.trim();
+    if (search) {
+      qb.andWhere(`LOWER(job.title) LIKE LOWER(:search) ESCAPE '\\'`, {
+        search: `%${escapeLike(search)}%`,
+      });
+    }
+
+    const { items, meta } = await this.runKeyset(qb, limit, query.cursor);
+    return { data: items.map((job) => this.toDiscoveryView(job)), meta };
+  }
+
+  // ───────────────────────── GET /jobs/teaser (public) ─────────────────────────
+
+  async getTeaser() {
+    const jobs = await this.jobsRepository
+      .createQueryBuilder('job')
+      .select([
+        'job.id', // required for entity hydration; never emitted
+        'job.title',
+        'job.category',
+        'job.areaCode',
+        'job.budget',
+        'job.createdAt',
+      ])
+      .where('job.deletedAt IS NULL')
+      .andWhere('job.status = :status', { status: JobStatus.OPEN })
+      .orderBy('job.createdAt', 'DESC')
+      .limit(TEASER_LIMIT)
+      .getMany();
+
+    return jobs.map((job) => ({
+      area: job.areaCode ?? null,
+      title: truncate(job.title, TEASER_TITLE_MAX),
+      category: job.category,
+      createdAt: job.createdAt,
+      budgetTier: toBudgetTier(job.budget),
+    }));
+  }
+
+  // ───────────────────────── Projections (strict allowlists) ─────────────────────────
+
+  private toDiscoveryView(job: Job) {
+    return {
+      id: job.id,
+      title: job.title,
+      description: truncate(job.description, DISCOVERY_DESCRIPTION_MAX),
+      category: job.category,
+      areaCode: job.areaCode,
+      location: coarseLocation(job.location),
+      currency: job.currency,
+      budget: job.budget,
+      status: job.status,
+      createdAt: job.createdAt,
     };
   }
 
-  /**
-   * Masks exact client street address, coordinates, and contact details from
-   * unauthenticated callers, non-party users, and artisans before escrow is funded.
-   * Full address is only revealed to:
-   * 1. Job owner (client)
-   * 2. Platform Admins
-   * 3. Assigned artisan once escrow is funded (JobStatus.IN_PROGRESS or COMPLETED)
-   */
-  coarsenJob(job: Job, caller?: { userId?: string; role?: string }) {
-    const isOwner = Boolean(caller?.userId && caller.userId === job.clientId);
-    const isAdmin = caller?.role === UserRole.ADMIN || caller?.role === UserRole.SUPER_ADMIN;
-    const isAssignedAndActive = Boolean(
-      caller?.userId &&
-      caller.userId === job.artisanId &&
-      (job.status === JobStatus.IN_PROGRESS || job.status === JobStatus.COMPLETED),
-    );
-
-    if (isOwner || isAdmin || isAssignedAndActive) {
-      return job;
-    }
-
-    // Fail closed: keep only the area. With 3+ comma segments (street, area, city) keep the
-    // last two; with 2 (street, area) keep only the last; with no comma we cannot tell a street
-    // from an area, so hide it entirely. A structured public area field would be better still.
-    let coarseLocation = 'Exact location shared after assignment';
-    if (job.location && job.location.includes(',')) {
-      const parts = job.location.split(',').map((p) => p.trim()).filter(Boolean);
-      coarseLocation = parts.length >= 3 ? parts.slice(-2).join(', ') : parts[parts.length - 1];
-    }
+  /** Full view for the job's own client / assigned artisan. Exact address only when allowed. */
+  private toPartyView(job: Job, userId: string) {
+    const isClient = job.clientId === userId;
+    const exactLocation =
+      isClient ||
+      (job.artisanId === userId &&
+        (job.status === JobStatus.IN_PROGRESS || job.status === JobStatus.COMPLETED));
 
     return {
-      ...job,
-      location: coarseLocation,
-      latitude: null,
-      longitude: null,
-      isLocationCoarsened: true,
+      id: job.id,
+      myRole: isClient ? 'CLIENT' : 'ARTISAN',
+      title: job.title,
+      description: job.description,
+      category: job.category,
+      areaCode: job.areaCode,
+      currency: job.currency,
+      budget: job.budget,
+      tranche1Amount: job.tranche1Amount,
+      tranche2Amount: job.tranche2Amount,
+      status: job.status,
+      clientId: job.clientId,
+      artisanId: job.artisanId,
+      location: exactLocation ? job.location : coarseLocation(job.location),
+      latitude: exactLocation ? job.latitude : null,
+      longitude: exactLocation ? job.longitude : null,
+      mediaUrls: job.mediaUrls ?? [],
+      createdAt: job.createdAt,
+      updatedAt: job.updatedAt,
     };
+  }
+
+  /** What a non-party sees on an OPEN job. Exact budget only for KYC-verified artisans. */
+  private toPublicView(job: Job, showExactBudget: boolean) {
+    return {
+      id: job.id,
+      title: job.title,
+      description: job.description,
+      category: job.category,
+      areaCode: job.areaCode,
+      location: coarseLocation(job.location),
+      status: job.status,
+      budgetTier: toBudgetTier(job.budget),
+      ...(showExactBudget ? { budget: job.budget, currency: job.currency } : {}),
+      createdAt: job.createdAt,
+    };
+  }
+
+  private async isVerifiedArtisan(caller?: { userId?: string; role?: string }) {
+    if (!caller?.userId || caller.role !== UserRole.ARTISAN) return false;
+    // Re-check against the DB: never trust a role/certification claim from the token alone.
+    const user = await this.usersRepository.findOne({
+      where: { id: caller.userId },
+      select: { id: true, role: true, isCertifiedByTark: true },
+    });
+    return Boolean(user && user.role === UserRole.ARTISAN && user.isCertifiedByTark);
   }
 
   async findOne(id: string) {
@@ -128,8 +259,22 @@ export class JobsService {
   }
 
   async findOneForCaller(id: string, caller?: { userId?: string; role?: string }) {
-    const job = await this.findOne(id);
-    return this.coarsenJob(job, caller);
+    const job = await this.jobsRepository.findOneBy({ id });
+    if (!job) {
+      throw new NotFoundException('Job not found');
+    }
+
+    const userId = caller?.userId;
+    if (userId && (job.clientId === userId || job.artisanId === userId)) {
+      return this.toPartyView(job, userId);
+    }
+
+    // Non-parties cannot tell a non-open job from a missing one.
+    if (job.status !== JobStatus.OPEN) {
+      throw new NotFoundException('Job not found');
+    }
+
+    return this.toPublicView(job, await this.isVerifiedArtisan(caller));
   }
 
   async update(id: string, updateJobDto: UpdateJobDto, userId: string) {
@@ -143,6 +288,9 @@ export class JobsService {
       );
     }
     Object.assign(job, updateJobDto);
+    if (updateJobDto.location !== undefined) {
+      job.areaCode = deriveAreaCodeFromLocation(job.location);
+    }
     return this.jobsRepository.save(job);
   }
 

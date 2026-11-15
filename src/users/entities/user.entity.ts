@@ -4,6 +4,7 @@ import {
   PrimaryGeneratedColumn,
   CreateDateColumn,
   UpdateDateColumn,
+  Index,
 } from 'typeorm';
 
 export enum UserRole {
@@ -14,6 +15,7 @@ export enum UserRole {
   DEVELOPER = 'developer',
 }
 
+@Index('idx_user_lower_email', { synchronize: false })
 @Entity()
 export class User {
   @PrimaryGeneratedColumn('uuid')
@@ -75,6 +77,15 @@ export class User {
 
   @Column('text', { array: true, default: '{}' })
   skills: string[];
+
+  // Admin-controlled trade scope: set at KYC approval / via the admin scope route.
+  // Deliberately NOT in UpdateProfileDto, so artisans cannot self-edit it.
+  @Column('text', { array: true, default: '{}' })
+  verifiedCategories: string[];
+
+  // Admin-verified coarse service area (normalized slug, city level).
+  @Column({ type: 'varchar', length: 64, nullable: true })
+  areaCode: string | null;
 
   @Column({ type: 'double precision', nullable: true })
   latitude: number;

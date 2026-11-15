@@ -8,6 +8,7 @@ import {
   Inject,
   forwardRef,
   InternalServerErrorException,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, DataSource, In, Not } from 'typeorm';
@@ -21,6 +22,13 @@ import { QueryKycDto } from './dto/query-kyc.dto';
 import { KycTriageService } from './services/kyc-triage.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { NotificationType } from '../notifications/entities/notification.entity';
+import { CategoriesService } from '../categories/categories.service';
+import { VerifiedScopeDto } from './dto/verified-scope.dto';
+import { normalizeAreaCode } from '../jobs/jobs.utils';
+
+// KYC documents must live under the Tark CDN's /cdn/ path, not just on its host.
+// (WHATWG URL parsing already collapses ../ and %2e%2e segments before this check.)
+const KYC_CDN_PATH_PREFIX = '/cdn/';
 
 @Injectable()
 export class KycService {
@@ -36,6 +44,7 @@ export class KycService {
     private configService: ConfigService,
     @Inject(forwardRef(() => NotificationsService))
     private notificationsService: NotificationsService,
+    private categoriesService: CategoriesService,
   ) {}
 
   private computeFallbackSha256(seed: string): string {
@@ -66,7 +75,11 @@ export class KycService {
       } catch {
         throw new BadRequestException(`${label} must be a valid URL`);
       }
-      if (parsed.protocol !== 'https:' || parsed.host !== cdnHost) {
+      if (
+        parsed.protocol !== 'https:' ||
+        parsed.host !== cdnHost ||
+        !parsed.pathname.startsWith(KYC_CDN_PATH_PREFIX)
+      ) {
         throw new BadRequestException(
           `${label} must be a document uploaded through Tark. ` +
             'Please upload the file in the app and use the returned URL.',
@@ -85,6 +98,19 @@ export class KycService {
   ): Promise<{ message: string; recordId: string; status: KycStatus }> {
     if (role !== UserRole.ARTISAN && role !== UserRole.SUPER_ADMIN && role !== UserRole.ADMIN) {
       throw new BadRequestException('Only registered artisans may submit credentials to the Tark Verification Desk.');
+    }
+
+    // In production, identity documents may only be accepted once private storage is confirmed.
+    if (
+      this.configService.get<string>('NODE_ENV') === 'production' &&
+      this.configService.get<string>('KYC_PRIVATE_STORAGE_READY') !== 'true'
+    ) {
+      this.logger.error(
+        'KYC submission refused: KYC_PRIVATE_STORAGE_READY is not \'true\' in production.',
+      );
+      throw new ServiceUnavailableException(
+        'Identity verification is temporarily unavailable. Please try again later.',
+      );
     }
 
     // Reject any URL not hosted on the Tark CDN before hitting the database
@@ -321,7 +347,7 @@ export class KycService {
   /**
    * Admin approves artisan verification and stamps Tark Certified badge.
    */
-  async approveKyc(recordId: string, adminUserId: string) {
+  async approveKyc(recordId: string, adminUserId: string, dto: VerifiedScopeDto = {}) {
     return this.dataSource.transaction(async (manager) => {
       const record = await manager.findOne(KycRecord, {
         where: { id: recordId },
@@ -329,8 +355,18 @@ export class KycService {
       });
 
       if (!record) throw new NotFoundException('KYC record not found');
-      if (record.status === KycStatus.APPROVED) {
-        throw new BadRequestException('This KYC credential has already been approved.');
+
+      if (record.userId === adminUserId) {
+        throw new ForbiddenException('Admins cannot review their own KYC submission');
+      }
+
+      if (
+        record.status !== KycStatus.PENDING_REVIEW &&
+        record.status !== KycStatus.RESUBMITTED
+      ) {
+        throw new BadRequestException(
+          `Cannot approve KYC record in status "${record.status}". Only pending submissions can be approved.`,
+        );
       }
 
       record.status = KycStatus.APPROVED;
@@ -348,6 +384,19 @@ export class KycService {
       user.kycStatus = KycStatus.APPROVED;
       if (!user.firstName) user.firstName = record.documentFirstName;
       if (!user.lastName) user.lastName = record.documentLastName;
+
+      // Verified trade scope is admin-controlled. Explicit categories are validated strictly;
+      // otherwise keep any existing scope, else snapshot the artisan's declared skills that
+      // resolve to active categories (unknown skills are dropped).
+      const requested = dto.verifiedCategories;
+      user.verifiedCategories = await this.resolveVerifiedCategories(
+        requested ??
+          (user.verifiedCategories?.length ? user.verifiedCategories : user.skills ?? []),
+        requested !== undefined,
+      );
+      if (dto.areaCode !== undefined) {
+        user.areaCode = this.requireAreaCode(dto.areaCode);
+      }
       await manager.save(user);
 
       // Multi-channel dispatch: Congratulations
@@ -377,6 +426,59 @@ export class KycService {
     });
   }
 
+  private async resolveVerifiedCategories(inputs: string[], strict: boolean): Promise<string[]> {
+    const slugs = new Set<string>();
+    for (const input of inputs) {
+      const category = await this.categoriesService.resolveCategory(input);
+      if (category) {
+        slugs.add(category.slug);
+      } else if (strict) {
+        throw new BadRequestException(`Unknown trade category "${input}".`);
+      }
+    }
+    return [...slugs];
+  }
+
+  private requireAreaCode(input: string): string {
+    const code = normalizeAreaCode(input);
+    if (!code) {
+      throw new BadRequestException('areaCode must contain letters or digits.');
+    }
+    return code;
+  }
+
+  /**
+   * Admin updates a certified artisan's verified trade categories and/or service area.
+   */
+  async updateVerifiedScope(userId: string, dto: VerifiedScopeDto, adminUserId: string) {
+    if (dto.verifiedCategories === undefined && dto.areaCode === undefined) {
+      throw new BadRequestException('Provide verifiedCategories and/or areaCode.');
+    }
+
+    const user = await this.userRepository.findOne({ where: { id: userId } });
+    if (!user) throw new NotFoundException('User not found');
+    if (user.role !== UserRole.ARTISAN || !user.isCertifiedByTark) {
+      throw new BadRequestException('Verified scope can only be set on Tark Certified artisans.');
+    }
+
+    const patch: Partial<User> = {};
+    if (dto.verifiedCategories !== undefined) {
+      patch.verifiedCategories = await this.resolveVerifiedCategories(dto.verifiedCategories, true);
+    }
+    if (dto.areaCode !== undefined) {
+      patch.areaCode = this.requireAreaCode(dto.areaCode);
+    }
+    await this.userRepository.update(userId, patch);
+
+    this.logger.log(`Admin ${adminUserId} updated verified scope for artisan ${userId}`);
+
+    return {
+      userId,
+      verifiedCategories: patch.verifiedCategories ?? user.verifiedCategories,
+      areaCode: patch.areaCode ?? user.areaCode,
+    };
+  }
+
   /**
    * Admin rejects verification with actionable reason.
    */
@@ -387,6 +489,19 @@ export class KycService {
     });
 
     if (!record) throw new NotFoundException('KYC record not found');
+
+    if (record.userId === adminUserId) {
+      throw new ForbiddenException('Admins cannot review their own KYC submission');
+    }
+
+    if (
+      record.status !== KycStatus.PENDING_REVIEW &&
+      record.status !== KycStatus.RESUBMITTED
+    ) {
+      throw new BadRequestException(
+        `Cannot reject KYC record in status "${record.status}". Only pending submissions can be rejected.`,
+      );
+    }
 
     record.status = KycStatus.REJECTED;
     record.rejectionReason = dto.reason;
@@ -424,7 +539,7 @@ export class KycService {
   }
 
   /**
-   * Secure document access: time-limited signed access token for document preview.
+   * Secure document access: verify permissions and return verified document URL.
    */
   async getSecureDocumentAccess(
     recordId: string,
@@ -446,18 +561,10 @@ export class KycService {
     const rawUrl = docType === 'selfie' ? record.selfieUrl : record.documentUrl;
     const sha = docType === 'selfie' ? record.selfieSha256 : record.documentSha256;
 
-    // Generate 15-minute signed token
-    const token = crypto
-      .createHmac('sha256', process.env.JWT_SECRET || 'tark-sec-token')
-      .update(`${recordId}:${docType}:${Date.now()}`)
-      .digest('hex');
-
     return {
       targetUrl: rawUrl,
       sha256: sha,
       docType,
-      expiresInSeconds: 900,
-      accessToken: token,
     };
   }
 }

@@ -260,10 +260,10 @@ export class PaymentsService {
         clipboardText: fullMessage,
         whatsappUrl: `https://wa.me/?text=${encodeURIComponent(fullMessage)}`,
         telegramUrl: `https://t.me/share/url?url=${encodeURIComponent(checkoutUrl)}&text=${encodeURIComponent(
-          `Hi, please help fund "${job.title}" (${formattedAmount}) for${client.fullName} on Tark Escrow.`,
+          `Hi, please help fund "${job.title}" (${formattedAmount}) for ${client.fullName} on Tark Escrow.`,
         )}`,
         smsUrl: `sms:?body=${encodeURIComponent(
-          `Hi, please help fund "${job.title}" (${formattedAmount}) for ${client.fullName} on Tark:${checkoutUrl}`,
+          `Hi, please help fund "${job.title}" (${formattedAmount}) for ${client.fullName} on Tark: ${checkoutUrl}`,
         )}`,
         email: {
           subject: emailSubject,
@@ -747,7 +747,8 @@ export class PaymentsService {
           });
           await queryRunner.manager.save(WalletLedger, ledger);
 
-          user.walletBalance = Number(user.walletBalance) + amountMajor;
+          user.walletBalance =
+            (Math.round(Number(user.walletBalance || 0) * 100) + amountMinor) / 100;
           await queryRunner.manager.save(User, user);
 
           await queryRunner.commitTransaction();
@@ -780,10 +781,11 @@ export class PaymentsService {
       this.logger.log(`Paystack ${event.event} received for reference: ${reference}`);
 
       // One code path for every payout outcome (dispatch response, webhook, reconciliation sweep).
-      // References that are not escrow tranche payouts (e.g. dispute payouts) are simply not matched.
+      // Escrow tranche payouts and dispute payouts (tark-dispute-<id>[-rN]) are both routed inside
+      // EscrowService.applyTransferOutcome; anything else is simply not matched.
       const result = await this.escrowService.applyTransferOutcome(reference, outcome, 'webhook');
       if (!result.matched) {
-        this.logger.warn(`No escrow found matching transfer reference: ${reference}`);
+        this.logger.warn(`No escrow or dispute found matching transfer reference: ${reference}`);
         return { status: 'ignored', message: result.message };
       }
       return { status: result.applied ? 'success' : 'ignored', message: result.message };

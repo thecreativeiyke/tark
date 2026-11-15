@@ -1,13 +1,11 @@
-import { IsOptional, IsString, IsEnum, IsInt, Min, Max } from 'class-validator';
+import { IsOptional, IsString, IsInt, Min, Max, MaxLength } from 'class-validator';
 import { Type } from 'class-transformer';
-import { JobStatus } from '../entities/job.entity';
 
 export class QueryJobDto {
   @IsOptional()
-  @Type(() => Number)
-  @IsInt()
-  @Min(1)
-  page?: number = 1;
+  @IsString()
+  @MaxLength(300)
+  cursor?: string;
 
   @IsOptional()
   @Type(() => Number)
@@ -16,15 +14,15 @@ export class QueryJobDto {
   @Max(100)
   limit?: number = 20;
 
+  // Narrows within the artisan's verified categories; it can never widen them.
   @IsOptional()
   @IsString()
+  @MaxLength(64)
   category?: string;
 
-  @IsOptional()
-  @IsEnum(JobStatus)
-  status?: JobStatus;
-
+  // Matches job title only.
   @IsOptional()
   @IsString()
+  @MaxLength(100)
   search?: string;
 }

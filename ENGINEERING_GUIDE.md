@@ -156,10 +156,10 @@ An artisan cannot initiate completion without submitting valid, authenticated HT
 Verification codes are strictly protected:
 - Track `failedAttempts` on the transaction.
 - If 5 incorrect attempts occur, lock the transaction, invalidate the code, and trigger an alert.
-- Generate codes using `crypto.randomInt(100000, 999999)`, never `Math.random()`.
+- Generate codes using `crypto.randomInt(100000, 1000000)` (the upper bound is exclusive, so this covers every 6-digit code), never `Math.random()`.
 
 ### 6. Payout Idempotency
-Never call Paystack's `/transfer` endpoint without a deterministic, unique transfer reference (e.g. `tranche1_${escrowId}_${timestamp}`). If network drops during the HTTP request, Paystack will reject duplicate transfers using the reference, preventing double payouts.
+Never call Paystack's `/transfer` endpoint without a deterministic, unique transfer reference (e.g. `tark-t1-${escrowId}` for Tranche 1, `tark-final-${escrowId}` for the final settlement, `tark-dispute-${disputeId}` for a dispute payout; a retry after a conclusive failure appends `-r1`, `-r2`). Never put a timestamp in the reference: it must be the same on every attempt for the same payout. If the network drops during the HTTP request, Paystack will reject a duplicate transfer using the reference, preventing double payouts.
 
 ### 7. Non-Refundable Platform Fee & In-App Refunds
 - In all dispute resolution scenarios, the platform service fee (e.g., 5%) is **strictly non-refundable**.

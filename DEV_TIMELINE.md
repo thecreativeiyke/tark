@@ -26,7 +26,8 @@
   - `scripts/test-kyc-url-validation.js`: 100% PASS (4 hostile & valid scenarios)
   - `scripts/test-upload-magic-bytes.js`: 100% PASS (41 checks across offline & live endpoints)
   - `scripts/redteam-active-hack-phase1.js`: 100% PASS (5 financial sink attacks repelled)
-  - `scripts/redteam-active-hack-phase2.js`: 100% PASS (6 privacy & IDOR attacks repelled)
+  - `scripts/redteam-active-hack-phase2.js`: 100% PASS (8 attacks repelled: auth leak, job discovery/teaser/me/non-open 404, bid IDOR, nearby `distanceBand` + `verifiedCategories` scope, malformed webhooks, support BOLA, public reviews allowlist/pagination, `PATCH /users/profile` scope injection)
+- **Discovery & Privacy**: Job discovery (`GET /jobs`) is artisan-only and scoped to admin-verified categories + area; `GET /jobs/me`, public `GET /jobs/teaser` and a locked-down `GET /jobs/:id` all use strict allowlist projections; reviews and nearby-artisan responses are allowlisted too (see ADR 009 Phase 10). Run `node scripts/migrate-verified-scope.js` on every database before starting the server.
 - **Config safety**: `DB_SYNCHRONIZE=false`. Database migrations versioned in `scripts/`.
 - **GitHub Repository**: [`https://github.com/thecreativeiyke/tark.git`](https://github.com/thecreativeiyke/tark.git) (`main` branch).
 - **Core Engineering Team**: Ikechukwu Alaeto (Founder & Product Lead), **Claude** & **Gemini** (Lead Engineers - AI Core).
@@ -34,6 +35,57 @@
 ---
 
 ## 🗓️ Session Log
+
+### 🗓️ 2026-11-15 — Session 15: Phase 2 — Verified Artisan Scope, Discovery/Teaser/Side-Door Lockdown, Reviews & Nearby Hardening
+- **Author**: Claude (via Claude Desktop + Filesystem extension) & the Founder
+- **Tag**: `[SHIPPED]` & `[DECISION]` — Full rationale in the Phase 10 amendment of [ADR 009](./docs/adr/009-security-hardening-phase1-phase2.md)
+- **Status**: **Phase 2 COMPLETE** (closing gate green, 2026-11-15: `tsc` 0 errors, Jest 74/74, red-team Phase 2 8/8 repelled).
+
+#### 🚀 What Shipped:
+1. **Verified scope**: `user.verifiedCategories` + `user.areaCode`, `job.areaCode` (derived from `location`); set at KYC approval (`approveKyc` takes an optional `{ verifiedCategories, areaCode }`) or via `PATCH /kyc/admin/artisans/:userId/scope`. Not writable through the profile DTO.
+2. **Jobs**: `GET /jobs/me` (party view, keyset pagination); `GET /jobs` (verified artisans only, forced `OPEN`, scoped to category + area, title-only escaped search, opaque cursor + `hasMore`, no `COUNT(*)`); public throttled `GET /jobs/teaser` (`{ area, title, category, createdAt, budgetTier }`); `GET /jobs/:id` with `ParseUUIDPipe`, 404 for non-parties unless `OPEN`, strict public projection (no admin bypass).
+3. **Reviews**: `GET /reviews/artisan/:artisanId` is UUID-validated, keyset-paginated (max 50) and returns only `{ id, rating, comment, proofMediaUrls, createdAt }`.
+4. **Nearby artisans**: `distanceKm` replaced by `distanceBand` (`< 2 km`, `2–5 km`, `5–10 km`, `10+ km`); ordering is band then id; explicit public allowlist. The `category` filter now matches admin-set `verifiedCategories` (trimmed, lowercased), not the self-editable `skills`, so an unverified artisan cannot self-tag into a regulated trade.
+5. **Migration**: `scripts/migrate-verified-scope.js` (3 columns, `job.areaCode` backfill, indexes on `job(clientId)`, `job(artisanId)`, `job(status, category, createdAt)`).
+6. **Tests**: `jobs.service.spec.ts`, `jobs.controller.spec.ts`, `reviews.service.spec.ts`, `users.service.spec.ts` rewritten/added, including exact-key pins for every projection so an accidental field leak fails CI.
+
+#### 🧪 Verification — honest status:
+- **Part A, run by the owner**: migration applied (27 job rows backfilled, 3 indexes); `npx tsc --noEmit` 0 errors; `GET /jobs` unauthenticated → 401; `GET /jobs/nearby` → 400 (routed to `:id`); `GET /jobs/teaser` → max 10 items with exactly the allowlisted keys.
+- **Part B, run by the owner (before the nearby-filter change)**:
+  - `npx tsc --noEmit`: 0 errors.
+  - `npm test -- --runInBand`: 5/5 suites, **70/70 tests** (`jobs.service.spec.ts`, `jobs.controller.spec.ts`, `reviews.service.spec.ts`, `users.service.spec.ts`, `app.controller.spec.ts`).
+  - Live: `GET /reviews/artisan/not-a-uuid` → 400; `GET /jobs` anonymous → 401; `GET /jobs/not-a-uuid` → 400; `GET /jobs/teaser` → max 10 items, exactly `{ area, title, category, createdAt, budgetTier }`.
+  - `autocannon -c 20 -d 10 /jobs/teaser`: 10 × 2xx, 2,701 × 429, 29 ms median latency (throttle holds).
+  - `X-Forwarded-For` spoofing (15 rotating IPs): 10 × 200, 5 × 429 (spoofed headers ignored).
+  - `>150KB` JSON body on `/auth/login` → 413. Forged `alg: none` admin JWT → 401. `POST /auth/register` with `role: "ADMIN"` / `isKycVerified: true` / `walletBalance: 5000000` → 400. Stale JWT after password change → 401. Forged Paystack webhook signature → 400.
+  - Old `redteam-active-hack-phase2.js` failed immediately on its unauthenticated `GET /jobs` expectation (401): the lockdown works, the script was stale.
+- **Owner decisions recorded**: keep the `10+ km` band; keep `proofMediaUrls` in public review projections (photos pass Tark's magic-byte validator); switch nearby `category` to `verifiedCategories`.
+- **After those decisions (this pass)**: `UsersService.findNearbyArtisans` now filters on `verifiedCategories`; `users.service.spec.ts` gained 4 tests (verified-not-skills, trim/lowercase normalization, no clause without category, blank category ignored). `scripts/redteam-active-hack-phase2.js` was rewritten for the new contracts.
+- **Closing gate, run by the owner (final state)**:
+  - `npx tsc --noEmit`: 0 errors.
+  - `npm test -- --runInBand`: 5/5 suites, **74/74 tests** (`jobs.service.spec.ts`, `jobs.controller.spec.ts`, `users.service.spec.ts`, `reviews.service.spec.ts`, `app.controller.spec.ts`).
+  - `node scripts/redteam-active-hack-phase2.js`: **all 8 attacks 100% repelled**: H-4 auth leak, H-2 job discovery/teaser/me/non-open 404, H-3 bid IDOR, H-1 nearby `distanceBand` + `verifiedCategories` scope, P-2 malformed webhooks, H-12 support BOLA, H-5 public reviews allowlist/pagination, H-6 `PATCH /users/profile` scope injection.
+  - Database cleaned after the run: all test accounts and child rows removed, keeping only the `super_admin` account and the static `category` lookup rows.
+
+#### ✅ Closing gate (run from the repo root, server on `localhost:3000`, wait ~60 s after any load test):
+```
+npx tsc --noEmit
+npm test -- --runInBand
+npx jest src/users/users.service.spec.ts --runInBand
+node scripts/redteam-active-hack-phase2.js
+```
+Result: `tsc` 0 errors; Jest 5/5 suites, 74/74 tests; red-team ended with `ALL PHASE 2 ACTIVE RED-TEAM ATTACKS WERE 100% REPELLED!`.
+
+#### ⚠️ Breaking changes for clients:
+- `GET /jobs` and `GET /reviews/artisan/:artisanId` now return `{ data, meta: { limit, hasMore, nextCursor } }`; `GET /jobs` needs a verified-artisan JWT; `status` / `page` params removed; nearby returns `distanceBand`.
+
+#### 🔜 Open / Next:
+1. Existing certified artisans have an empty scope until an admin sets it (no `skills` grandfathering).
+2. ~~`GET /users/artisans/nearby` still filters `category` on self-declared `skills`~~ — fixed: it matches `verifiedCategories`.
+3. `CreateJobDto.mediaUrls` / `currency` validation, and `ParseUUIDPipe` on `PATCH` / `DELETE /jobs/:id`.
+4. ~~Re-run `redteam-active-hack-phase2.js` after updating it~~ — done; 8/8 attacks repelled.
+
+---
 
 ### 🗓️ 2026-11-14 — Session 14: Authentication Lifecycle, Session Revocation (`tokenVersion`) & Timing Attack Hardening
 - **Author**: Lead Engineer (AI Model: Gemini / Antigravity) & Ikechukwu Alaeto (Founder)
@@ -82,7 +134,7 @@
    - Verified via `scripts/test-kyc-url-validation.js`.
    - Commit: `0ccdb6e`.
 3. **Two-Phase Decoupled Payout State Machine (`src/escrow/escrow.service.ts`, `src/payments/payments.service.ts`)**:
-   - Phase 1: DB row lock sets `PAYOUT_PENDING` and deterministic reference (`tark-t1-<id>` / `tark-t2-<id>`), commits immediately.
+   - Phase 1: DB row lock sets `PAYOUT_PENDING` and deterministic reference (`tark-t1-<id>` for Tranche 1, `tark-final-<id>` for the final settlement; retries append `-r1`, `-r2`), commits immediately.
    - External Paystack transfer call executes outside DB lock, preventing row lock freezes and connection exhaustion.
    - Phase 2: `applyTransferOutcome()` handles status (`success` settles; `pending/otp` stays pending; `failed` sets `PAYOUT_FAILED`).
    - Background sweeper reconciles stuck `PAYOUT_PENDING` rows via Paystack verification.

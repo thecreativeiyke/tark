@@ -5,12 +5,15 @@ import {
   Patch,
   Body,
   Param,
+  ParseUUIDPipe,
+  Query,
   UseGuards,
   Request,
 } from '@nestjs/common';
 import { ReviewsService } from './reviews.service';
 import { CreateReviewDto } from './dto/create-review.dto';
 import { ModerateReviewDto } from './dto/moderate-review.dto';
+import { QueryArtisanReviewsDto } from './dto/query-artisan-reviews.dto';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { Roles } from '../auth/decorators/roles.decorator';
@@ -40,8 +43,11 @@ export class ReviewsController {
 
   // 2. Public endpoint: View approved reviews for an artisan
   @Get('artisan/:artisanId')
-  getArtisanReviews(@Param('artisanId') artisanId: string) {
-    return this.reviewsService.getPublicArtisanReviews(artisanId);
+  getArtisanReviews(
+    @Param('artisanId', new ParseUUIDPipe()) artisanId: string,
+    @Query() query: QueryArtisanReviewsDto,
+  ) {
+    return this.reviewsService.getPublicArtisanReviews(artisanId, query);
   }
 
   // 3. Admin endpoint: View moderation queue of pending reviews

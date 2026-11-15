@@ -224,3 +224,141 @@ Security review identified gaps in user identity and session lifecycle:
   - Step 9: Authenticated change-password rejecting wrong current password (401), succeeding with correct password, and revoking prior JWT.
   - 100% of tests passed.
 
+---
+
+## Amendment: Phase 9 — Audit of the Uncommitted Hardening Pass & Corrections to Earlier Wording (2026-11-14)
+
+**Status of this amendment: ACTIVE.** Written from a read-only audit of the working tree (files modified after commit `bedeca7`), then remediated in the Phase 1 finishing pass recorded in "Remediation applied" below. The audit findings and corrections stay as written; items that are now fixed are marked in "Known limits". Verification of the remediation edits is tracked in the Verification section.
+
+### Corrections to earlier wording
+
+1. **Payout reference names (Phase 7; DEV_TIMELINE Session 13).** Those texts say `tark-t1-<id>` / `tark-t2-<id>`. The code uses `tark-t1-<escrowId>` for Tranche 1 and `tark-final-<escrowId>` for the final settlement (any unpaid Tranche 1 plus Tranche 2, minus the platform fee). A retry after a conclusive failure appends `-r1`, `-r2`, and so on. There is no `tark-t2-` reference. Dispute payouts use `tark-dispute-<disputeId>`, which `applyTransferOutcome` does not match (see Known limits).
+
+2. **The wallet ledger is single-entry, not double-entry (Phase 1 §1 and §4; Phase 3 item 3).** `wallet_ledgers` is a per-wallet journal. Each row has a UNIQUE `reference` (the idempotency key), `userId`, `amount`, and a `type`. It has no counter-account and no `balanceAfter`. It does not record online escrow funding (the `ESCROW_FUNDING` enum value has no writer in `payments.service.ts` or `escrow.service.ts`; confirm with `git grep ESCROW_FUNDING`), tranche payouts, retained platform fees (`feeCollectedMinor` lives on `escrow_transaction`) or dispute payouts to artisans. "Append-only" is a convention, not a database rule (no trigger blocks UPDATE or DELETE). `wallet_sane` keeps a balance non-negative and not NaN; nothing enforces that `walletBalance` equals the sum of its ledger rows. Read "wallet debit auditability" as "wallet credits and debits are idempotent and traceable", not as a complete financial audit trail.
+
+3. **Upload inspection is header-only (Phase 5).** `detectFileType` proves a file starts like a JPEG, PNG, WebP, HEIC, MP4, MOV or WebM. It cannot detect a polyglot (a valid image or video with a script or other payload appended or embedded), and it does not strip metadata, so EXIF GPS coordinates in photos survive upload. "Rejects HTML, SVG, PHP and executables" means such files are rejected when they do not start with an accepted signature. Defence against a polyglot depends on serving: the detected content type, `X-Content-Type-Options: nosniff`, a cookieless asset origin, and ideally re-encoding images. `helmet()` sets nosniff on the API origin only; the headers on the CDN gateway were not verified. The brand lists in Phase 5 are abbreviated; the code accepts a wider set (9 HEIC, 18 MP4/ISO, 1 QuickTime brand).
+
+4. **Handshake code delivery (ADR 003, ADR 006 body).** The 6-digit Job Completion Code reaches the client through exactly two channels: the authenticated `GET /escrow/:id`, and the handshake-ready email. The SMS carries a prompt without the code. The push body and the stored in-app message do not carry it either (ADR 006 amendment 2, ADR 007 §4). Any text saying the code is sent by SMS is wrong. The comment in `EscrowService.initiateHandshake` ("via Email, In-App, Push & SMS") describes the alert, not the code. The email copy of the code sits in the mail provider's logs; the 15-minute expiry and single use are the mitigation. Real SMS delivery has never been achieved (ADR 006 amendment 6).
+
+5. **KYC URL shield compares host only (Phase 6).** Phase 6 says the parsed `origin` and `pathname` must match the CDN base. `validateKycUrls` checks `protocol === 'https:'` and `host` only. Any file on the CDN host passes, including another user's upload. Compare `validateProofUrls`, which also requires the `/escrow/proof-of-work/` path segment. In addition, `documentSha256` and `selfieSha256` are client-supplied, and the fallback hash includes `userId` and `Date.now()`, so the document-hash duplicate check cannot match in practice; only the `idNumber` check is effective.
+
+6. **Timing and revocation claims (Phase 8).** (a) `login` always runs `bcrypt.compare`, so unknown emails cost the same as known ones. `forgot-password` returns an identical body, but for a registered email it awaits an extra UPDATE, a notification INSERT and a user lookup before responding, so response time is not equalised. (b) There is no ban or suspension flag. Sessions are revoked only by a `tokenVersion` bump (password reset or change). Role changes take effect immediately because `JwtStrategy.validate` reads the role from the database. (c) `change-password` increments `tokenVersion`, which also revokes the caller's own token; the response says "other sessions" and returns no new token. (d) `scripts/test-auth-lifecycle.js` lists a tenth scenario (login timing) in its header that has no step.
+
+7. **Dispute payout ordering (Phase 4, Known limits).** That text says the artisan transfer is sent before the database transaction commits. In the working tree `DisputesService.resolve` sends it after the commit. The failure mode is now the reverse: see Known limits.
+
+### Known limits found during this audit (status after the Phase 1 finishing pass)
+- **FIXED (Remediation 1–3).** **Dispute artisan payout has no durable pending record.** After `resolve` commits (dispute `RESOLVED`, escrow `SETTLED`, tranches `RELEASED`), a failed or timed-out `initiateTransfer` is only logged. Nothing retries it, `tark-dispute-*` webhooks are not reconciled, and calling `resolve` again is rejected. The artisan can be recorded as paid and not be paid. The Phase 7 pattern (commit `PAYOUT_PENDING` and a reference first, then dispatch, then reconcile) should be applied to dispute payouts.
+- **FIXED (Remediation 4).** `DisputesService.assign` has no status check and can move a `RESOLVED` dispute back to `UNDER_INVESTIGATION`.
+- **FIXED (Phase 10).** `GET /reviews/artisan/:artisanId` is public and returns whole review rows, including `adminNotes`, `moderatedBy`, `clientId` and `jobId`, with no pagination.
+- **OPEN.** `CreateJobDto.mediaUrls` accepts arbitrary URLs (no CDN-host check) and `currency` accepts any string.
+- **FIXED (Phase 10).** `GET /users/artisans/nearby` rounds distance to 0.1 km but accepts any query point, so repeated queries can trilaterate an artisan's stored coordinates.
+
+### 13-point remediation list (owner's audit)
+1. **Disputes/payouts collision.** `pessimistic_write` lock, reject a dispute while a tranche is `PAYOUT_PENDING`; `applyTransferOutcome` must not overwrite `DISPUTED`.
+2. **Dispute payout skipped the two-phase design.** Commit `PAYOUT_PENDING` + `tark-dispute-<id>` before dispatch; reconcile via webhook and sweep; `PATCH /disputes/:id/retry-payout` (see Remediation applied 1–3).
+3. **Dispute refunds ignored currency and tranche status.** Guard `currency === 'NGN'`; leave already-`RELEASED` tranches untouched.
+4. **Reset password was not atomic.** Single `UPDATE` that increments `tokenVersion` where the token matches and `expiresAt > NOW()`.
+5. **Forgot-password timing, HTML escaping and cooldown.** HTML-escape `fullName`, 60-second cooldown, fire-and-forget email branch (see Remediation applied 7).
+6. **Email collision race returned 500.** Unique index plus catch of Postgres `23505` → `ConflictException`.
+7. **KYC approve/reject lacked a status guard.** Restrict to `PENDING_REVIEW` / `RESUBMITTED`; block admin self-review.
+8. **KYC signed access token was inert.** Removed the unused fake HMAC and the hardcoded fallback secret.
+9. **Wallet top-up used float addition.** Integer kobo math.
+10. **Platform 5% fee used float calculation.** Integer kobo math.
+11. **JWT strategy returned a stale role.** `JwtStrategy.validate()` returns the live database `role`.
+12. **CORS allowlist, `@MaxLength(72)` on passwords, Supabase ref scrubbed from `.env.example`.**
+13. **Documentation accuracy.** Single-entry ledger reality, header-only upload check vs polyglots/EXIF, `tark-final-<id>` reference naming, email-only PIN delivery, and the `DEV_TIMELINE.md` / `ENGINEERING_GUIDE.md` corrections.
+
+### Remediation applied (Phase 1 finishing pass)
+1. **Two-phase dispute payout (fixes the first Known limit and correction 7).** `Dispute` gained `payoutStatus` (`NOT_REQUIRED` / `PAYOUT_PENDING` / `RELEASED` / `PAYOUT_FAILED`), `payoutReference` (UNIQUE) and `payoutDispatchedAt`, plus a partial index on pending payouts. `DisputesService.resolve` commits `PAYOUT_PENDING` and the reference `tark-dispute-<disputeId>` inside the verdict transaction, then dispatches the transfer after commit via `EscrowService.dispatchDisputePayout`. `RELEASED` is recorded only on provider confirmation. Timeouts, 5xx errors and `pending` / `otp` statuses stay `PAYOUT_PENDING`; a provider rejection is verified before the payout is marked `PAYOUT_FAILED`. The `resolve` response reports `artisanPayoutStatus` and counts only confirmed money in `artisanDisbursedToBank`.
+2. **Dispute payout outcomes.** `EscrowService.applyTransferOutcome` routes `tark-dispute-*` references to the dispute row, so `transfer.success`, `transfer.failed` and `transfer.reversed` webhooks, the dispatch response and the reconciliation sweep all use one idempotent path. `reconcilePendingPayouts` (timer and `POST /escrow/admin/reconcile-payouts`) now also sweeps pending dispute payouts. A transfer the provider has never heard of becomes `PAYOUT_FAILED` after the grace period.
+3. **Admin retry.** `PATCH /disputes/:id/retry-payout` re-dispatches a `PAYOUT_FAILED` payout with a fresh reference (`-r1`, `-r2`, ...). It first asks the provider about the old reference and refuses to send if that transfer succeeded or is still in flight.
+4. **`assign` guard.** `DisputesService.assign` takes a row lock and rejects `RESOLVED` and `DISMISSED` disputes, so a verdict can no longer be reopened (the enum has no `CLOSED`).
+5. **KYC.** In production `submitKyc` refuses unless `KYC_PRIVATE_STORAGE_READY === 'true'` (503). `validateKycUrls` now also requires the `/cdn/` path prefix, closing the host-only gap in correction 5 (the client-supplied hash weakness in that item remains).
+6. **Notification enum.** `KYC_SUBMITTED` existed in the TypeScript `NotificationType` but not in the database enum, so the receipt notification failed. `scripts/migrate-dispute-payout.js` adds every `NotificationType` value to `notifications_type_enum` idempotently.
+7. **Forgot-password timing (correction 6a).** The notification dispatch for a registered email is fire-and-forget with error logging. The token UPDATE is still awaited, so a small difference remains.
+8. **Housekeeping.** Removed the unused `DisputeCategory` import and the unused `totalBudget` variable, fixed the mis-indented verdict-notification block, and fixed two missing spaces in the Pay-For-Me share text.
+9. **Docs.** `DEV_TIMELINE.md` and `ENGINEERING_GUIDE.md` payout reference and PIN range corrected; ADR index extended to Phases 1–9.
+
+### Verification
+- Baseline before the finishing pass (recorded by the owner): `npx tsc --noEmit` and `npm run build` with 0 errors; `test-auth-lifecycle.js` 27/27, `test-kyc-url-validation.js` 4/4, `test-upload-magic-bytes.js` 41/41, `test-payout-two-phase.js` 57/57.
+- After the finishing pass (all run by the owner, 0 regressions): `node scripts/migrate-dispute-payout.js` applied cleanly (no legacy stuck disputes); `npx tsc --noEmit` and `npm run build` 0 errors; `test-auth-lifecycle.js` 27/27; `test-kyc-url-validation.js` 4/4 (the `notifications_type_enum` warning no longer appears); `test-upload-magic-bytes.js` 41/41; `test-payout-two-phase.js` 57/57.
+- `test-webhook-and-dispute.js` stops at Step 2 (`An escrow can only be created after a bid has been accepted for this job`). The script predates the accepted-bid requirement for escrow creation; it needs a bid-acceptance step before it can exercise the dispute path. Not a regression from this pass.
+- Not re-run against the amended code: `redteam-active-hack-phase1.js`, `redteam-active-hack-phase2.js`.
+
+---
+
+## Amendment: Phase 10 — Phase 2 Discovery, Teaser & Side-Door Hardening (2026-11-15)
+
+### Context
+After Phases 1–9 the job and reputation read paths still leaked or over-trusted:
+1. `GET /jobs` used `OptionalJwtAuthGuard`, accepted a caller-chosen `status`, and returned whole `Job` rows to anyone (including `clientId`, tranche amounts, `mediaUrls`).
+2. `GET /jobs/:id` served any job id, in any status, with the same fields. Phase 1 §5 (H-2) only coarsened the address.
+3. There was no personal workspace endpoint, so clients and artisans had no safe way to list their own jobs.
+4. An artisan's trade categories were the self-editable `skills` array, so "verified" scope did not exist.
+5. `GET /reviews/artisan/:artisanId` returned whole review rows (see Phase 9 Known limits) with no pagination.
+6. `GET /users/artisans/nearby` exposed distance at 0.1 km resolution, which allows trilateration of stored coordinates.
+
+### Decision
+
+**A. Verified trade scope (admin-controlled).**
+- New columns: `user.verifiedCategories text[]` (default `{}`), `user.areaCode varchar(64)`, `job.areaCode varchar(64)`. `UpdateProfileDto` is unchanged, so artisans cannot write them.
+- `job.areaCode` is derived server-side from `location` (last comma segment, normalized to a slug, e.g. `ibadan`) on create and whenever `location` is updated. A location with no comma yields `NULL`. Artisan area codes are set by admins at the same (city) granularity.
+- `KycService.approveKyc(recordId, adminId, dto)` accepts optional `{ verifiedCategories, areaCode }`. Explicit categories must each resolve to an active category (else 400). With no body, an existing scope is kept; otherwise the artisan's declared `skills` that resolve to active categories are snapshotted.
+- `PATCH /kyc/admin/artisans/:userId/scope` (admin / super_admin) updates scope for a Tark-Certified artisan. Both paths validate categories through `CategoriesService.resolveCategory` and normalize the area code.
+
+**B. `GET /jobs/me`.** `JwtAuthGuard`; `req.user?.userId` asserted (401 otherwise) before any query; `WHERE clientId = :userId OR artisanId = :userId`; keyset pagination; strict allowlist "party view" (exact address and coordinates only for the client, or for the assigned artisan while the job is `IN_PROGRESS` / `COMPLETED`).
+
+**C. `GET /jobs` (artisan discovery).** `JwtAuthGuard` + `RolesGuard` (`ARTISAN`), then a database re-check that the user is an artisan with `isCertifiedByTark` (403 otherwise). `status = 'OPEN'` is forced; the `status` and `page` query params were removed. Results are limited to `category IN (verifiedCategories)` and `areaCode = artisan.areaCode`; the optional `category` filter can only narrow, never widen. Search matches `title` only, with `%`, `_` and `\` escaped. Pagination is an opaque keyset cursor over `(createdAt DESC, id DESC)` using `limit + 1` for `hasMore` (no `COUNT(*)`); the cursor carries Postgres' own text rendering of `createdAt` so microseconds are not lost. An artisan with no scope receives an empty page. Output allowlist: `id, title, description (truncated to 200 chars), category, areaCode, location (coarse), currency, budget, status, createdAt`.
+
+**D. `GET /jobs/teaser` (public).** No JWT guard; `@Throttle` 10 req/min per IP on top of the global limit. At most 10 `OPEN` jobs; allowlist `{ area, title (40 chars), category, createdAt, budgetTier }`. `budgetTier` is `MICRO` / `STANDARD` / `MAJOR`, or `CUSTOM_QUOTE` when the budget is 0 or null; thresholds live in `jobs.utils.ts` and are never sent. No job ids, user ids, raw amounts, currency or coordinates. The query selects only the columns it emits (plus `id`, needed for entity hydration and never emitted).
+
+**E. `GET /jobs/:id` side door.** `ParseUUIDPipe`. The client or assigned artisan gets the party view. Everyone else (anonymous users, other users and admins alike) gets `404` unless `status === 'OPEN'`, and then a public view: `id, title, description, category, areaCode, location (coarse), status, budgetTier, createdAt`, plus `budget` and `currency` only when the caller is an artisan who is `isCertifiedByTark` in the database (the token claim alone is not trusted). `tranche1Amount`, `tranche2Amount`, `clientId`, `artisanId`, `mediaUrls` and coordinates are never part of the public view.
+
+**F. `GET /reviews/artisan/:artisanId`.** `ParseUUIDPipe` on the id; keyset pagination with `limit` default 20, max 50; explicit allowlist `{ id, rating, comment, proofMediaUrls, createdAt }`. `adminNotes`, `moderatedBy`, `moderatedAt`, `clientId`, `jobId`, `status` and `updatedAt` are not returned.
+
+**G. `GET /users/artisans/nearby`.** `distanceKm` is replaced by `distanceBand`: `< 2 km`, `2–5 km`, `5–10 km`, and `10+ km` (added because the search radius can reach 50 km; owner decision: keep). Results are ordered by band, then `id`; ordering by exact distance would leak the ranking inside a band. Allowlist: `id, fullName, role, skills, isCertifiedByTark, createdAt, distanceBand`. The optional `category` filter matches the admin-set `verifiedCategories` (trimmed and lowercased), not the self-editable `skills`, so an unverified artisan cannot self-tag into a regulated trade and appear in a category search.
+
+**H. Migration.** `scripts/migrate-verified-scope.js` (idempotent, one transaction): adds the three columns, backfills `job.areaCode`, and creates `IDX_job_clientId`, `IDX_job_artisanId` and `IDX_job_status_category_createdAt` (names match the `@Index` decorators in `job.entity.ts`).
+
+### Corrections to earlier wording
+- Phase 1 §5 (H-2) says `GET /jobs` and `GET /jobs/:id` use `OptionalJwtAuthGuard` and reveal full detail to admins. Superseded: `GET /jobs` now requires a verified artisan, and on `GET /jobs/:id` admins are treated as non-parties (no admin bypass).
+- Phase 1 §5 (H-1) says distance is "rounded to 1 decimal place". Superseded by the bands in G.
+
+### Breaking API changes
+- `GET /jobs` and `GET /reviews/artisan/:artisanId` return `{ data, meta: { limit, hasMore, nextCursor } }` instead of an array / `{ data, meta: { total, page, ... } }`.
+- `GET /jobs` rejects anonymous and non-artisan callers; `status` and `page` are gone.
+- `GET /users/artisans/nearby` returns `distanceBand` instead of `distanceKm`.
+
+### Known limits (not addressed here)
+- Existing certified artisans start with an empty scope and see no jobs on `GET /jobs` until an admin sets it (`PATCH /kyc/admin/artisans/:userId/scope`); the migration does not grandfather `skills`.
+- ~~`GET /users/artisans/nearby` still filters `category` against the self-declared `skills` array, not `verifiedCategories`.~~ Resolved in the closing pass (see G).
+- Distance bands reduce but do not remove trilateration: an attacker can still probe band boundaries (2, 5, 10 km) within the 30 req/min throttle.
+- `budgetTier` thresholds assume NGN-scale amounts and ignore `currency`.
+- `proofMediaUrls` on approved reviews are public by owner decision (they are the review's evidence and pass Tark's magic-byte validator); they carry no EXIF scrubbing (see Phase 9 correction 3).
+- `PATCH /jobs/:id`, `DELETE /jobs/:id` and `CreateJobDto.mediaUrls` / `currency` validation are unchanged.
+- The keyset cursor assumes `createdAt` is `timestamp without time zone` (the TypeORM default for `@CreateDateColumn`).
+
+### Verification
+- Part A (run by the owner against the local server and Supabase): `node scripts/migrate-verified-scope.js` applied cleanly (`user.verifiedCategories` + `user.areaCode` ready, `job.areaCode` backfilled 27 rows, 3 job indexes created); `npx tsc --noEmit` 0 errors; `GET /jobs` unauthenticated → 401; `GET /jobs/nearby` → 400 (`uuid is expected`, i.e. it is routed to `:id`); `GET /jobs/teaser` returns at most 10 items with exactly `{ area, title, category, createdAt, budgetTier }`.
+- Part B (run by the owner, before the nearby-filter change):
+  - `npx tsc --noEmit`: 0 errors. `npm test -- --runInBand`: 5/5 suites, **70/70 tests** (`jobs.service.spec.ts`, `jobs.controller.spec.ts`, `reviews.service.spec.ts`, `users.service.spec.ts`, `app.controller.spec.ts`).
+  - Live: `GET /reviews/artisan/not-a-uuid` → 400; `GET /jobs` unauthenticated → 401; `GET /jobs/not-a-uuid` → 400.
+  - Stress: `autocannon -c 20 -d 10 /jobs/teaser` → 10 × 2xx, 2,701 × 429, 29 ms median latency. `X-Forwarded-For` spoofing with 15 rotating IPs → 10 × 200, 5 × 429 (spoofed headers ignored).
+  - Adversarial: `>150KB` JSON on `/auth/login` → 413; forged `alg: none` admin JWT → 401; `POST /auth/register` with `role: "ADMIN"`, `isKycVerified: true`, `walletBalance: 5000000` → 400; stale JWT replay after password change → 401; forged Paystack webhook signature → 400.
+  - The previous `redteam-active-hack-phase2.js` failed immediately on its unauthenticated `GET /jobs` expectation (401), which confirmed the lockdown and that the script was stale.
+- Closing pass: `UsersService.findNearbyArtisans` filters `category` on `verifiedCategories`; `users.service.spec.ts` gained 4 tests (Jest total 70 → 74); `scripts/redteam-active-hack-phase2.js` was rewritten for the Phase 10 contracts and asserts, against the live server and database:
+  - `GET /jobs`: 401 anonymous, 403 for clients, `{ data, meta }` with the exact discovery keys for a verified artisan, only `OPEN` jobs, hidden when the artisan's area or category differs, with an empty scope, or when `?category=` names an unverified trade; `?status=` cannot widen results.
+  - `GET /jobs/teaser`: public, ≤ 10 items, exact keys, no ids/street/coordinates/raw budget.
+  - `GET /jobs/me`: 401 anonymous, party view with exact address for the owner only, nothing for strangers, 400 on a garbage cursor.
+  - `GET /jobs/:id`: 400 on a non-UUID, 404 for an unknown id, public view keys (plus `budget`/`currency` only for a verified artisan), exact address and coordinates only for the owner, 404 for anonymous/outsider/unassigned artisan once the job is not `OPEN`.
+  - `GET /reviews/artisan/:id`: 400 on a non-UUID, only `APPROVED` rows, exact keys, no `adminNotes`/`moderatedBy`/`clientId`/`jobId`, `createdAt DESC` order, keyset pages with no duplicates, 400 on a garbage cursor, `limit` capped at 50.
+  - `GET /users/artisans/nearby`: 401 anonymous, exact keys, `distanceBand` and no `distanceKm`, an artisan at the query point in `< 2 km`, a self-tagged unverified trade hidden from `?category=`, the verified trade found (case-insensitively).
+  - `PATCH /users/profile` cannot change `verifiedCategories` or `areaCode` (checked in the database).
+  - The Phase 1 §5 checks (password hash, bid IDOR, malformed webhooks, support BOLA) are retained.
+- **Closing gate, run by the owner (final state, 2026-11-15)** — status: **Phase 2 COMPLETE**:
+  - `npx tsc --noEmit`: 0 errors.
+  - `npm test -- --runInBand`: 5/5 suites, **74/74 tests** (`jobs.service.spec.ts`, `jobs.controller.spec.ts`, `users.service.spec.ts`, `reviews.service.spec.ts`, `app.controller.spec.ts`).
+  - `node scripts/redteam-active-hack-phase2.js`: **all 8 attacks 100% repelled** (H-4 auth leak, H-2 job discovery/teaser/me/non-open 404, H-3 bid IDOR, H-1 nearby `distanceBand` + `verifiedCategories` scope, P-2 malformed webhooks, H-12 support BOLA, H-5 public reviews allowlist/pagination, H-6 `PATCH /users/profile` scope injection).
+  - The database was cleaned after the run: all test accounts and child rows removed, keeping only the `super_admin` account and the static `category` lookup rows.
+  - Operational note: `/jobs/teaser` is throttled to 10 requests per minute per IP and the script calls it once, so wait about 60 seconds after any load test before running it.
+

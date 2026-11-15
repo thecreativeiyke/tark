@@ -28,6 +28,7 @@ import { User } from '../users/entities/user.entity';
 import { PaymentsService } from '../payments/payments.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { TransferDispatchError } from '../payments/interfaces/payment-gateway.interface';
+import { Dispute, DisputePayoutStatus, DisputeStatus } from '../disputes/entities/dispute.entity';
 
 // Maximum failed PIN attempts before the handshake is reset
 const MAX_PIN_ATTEMPTS = 5;
@@ -44,6 +45,20 @@ type PayoutKind = 'T1' | 'FINAL';
 // Everything needed to call the provider, captured while the escrow row was locked.
 interface PayoutDispatch {
   kind: PayoutKind;
+  escrowId: string;
+  amountMinor: number;
+  recipientCode: string;
+  reference: string;
+  reason: string;
+  currency: string;
+}
+
+// Dispute artisan payouts use tark-dispute-<disputeId> (then -r1, -r2 ... after a conclusive failure).
+const DISPUTE_PAYOUT_REF_PREFIX = 'tark-dispute-';
+
+// Captured inside the verdict transaction (DisputesService.resolve) and handed to the provider call.
+export interface DisputePayoutDispatch {
+  disputeId: string;
   escrowId: string;
   amountMinor: number;
   recipientCode: string;
@@ -428,6 +443,11 @@ export class EscrowService implements OnModuleInit, OnModuleDestroy {
     outcome: 'SUCCESS' | 'FAILED',
     source: string,
   ): Promise<{ matched: boolean; applied: boolean; message: string }> {
+    // Dispute artisan payouts are tracked on the Dispute row, not on an escrow tranche.
+    if (reference.startsWith(DISPUTE_PAYOUT_REF_PREFIX)) {
+      return this.applyDisputePayoutOutcome(reference, outcome, source);
+    }
+
     const result = await this.dataSource.transaction(async (manager) => {
       const escrow = await manager.findOne(EscrowTransaction, {
         where: [{ tranche1TransferRef: reference }, { tranche2TransferRef: reference }],
@@ -468,10 +488,12 @@ export class EscrowService implements OnModuleInit, OnModuleDestroy {
           }
           escrow.tranche1Status = TrancheStatus.RELEASED;
           escrow.tranche2Status = TrancheStatus.RELEASED;
-          escrow.totalStatus = EscrowStatus.SETTLED;
+          if (escrow.totalStatus !== EscrowStatus.DISPUTED) {
+            escrow.totalStatus = EscrowStatus.SETTLED;
+            await manager.update(Job, escrow.jobId, { status: JobStatus.COMPLETED });
+          }
           escrow.handshakePin = null;
           escrow.handshakeExpiresAt = null;
-          await manager.update(Job, escrow.jobId, { status: JobStatus.COMPLETED });
         }
         const saved = await manager.save(EscrowTransaction, escrow);
         return { matched: true, applied: true, message: `Transfer ${reference} confirmed and escrow updated`, kind, escrow: saved };
@@ -512,6 +534,301 @@ export class EscrowService implements OnModuleInit, OnModuleDestroy {
       this.notifyPayoutConfirmed(result.escrow, result.kind);
     }
     return { matched: result.matched, applied: result.applied, message: result.message };
+  }
+
+  // ─────────────────────────────────────────────────────────────────────
+  // DISPUTE ARTISAN PAYOUTS — same three phases as escrow payouts
+  //   Phase 1  DisputesService.resolve commits PAYOUT_PENDING + reference with the verdict.
+  //   Phase 2  dispatchDisputePayout: provider call, outside any transaction or lock.
+  //   Phase 3  applyDisputePayoutOutcome: dispatch response, webhook and reconciliation sweep.
+  // RELEASED is only ever recorded on provider confirmation.
+  // ─────────────────────────────────────────────────────────────────────
+  async dispatchDisputePayout(d: DisputePayoutDispatch): Promise<DisputePayoutStatus> {
+    await this.dataSource
+      .getRepository(Dispute)
+      .update({ id: d.disputeId }, { payoutDispatchedAt: new Date() })
+      .catch((err) =>
+        this.logger.warn(`Dispute #${d.disputeId}: could not stamp payoutDispatchedAt: ${err?.message}`),
+      );
+
+    let transfer: { status: string; simulated?: boolean };
+    try {
+      transfer = await this.paymentsService.initiateTransfer(
+        d.amountMinor,
+        d.recipientCode,
+        d.reason,
+        d.currency,
+        d.reference,
+      );
+    } catch (err: any) {
+      const outcome = this.classifyDispatchError(err);
+      this.logger.error(
+        `Dispute #${d.disputeId}: transfer ${d.reference} dispatch error (${outcome}): ${err?.message}`,
+      );
+
+      if (outcome === 'REJECTED') {
+        // The provider says no transfer was created. Confirm before marking it failed.
+        const known = await this.paymentsService
+          .verifyTransfer(d.reference, d.currency)
+          .catch(() => null);
+        if (known?.found) {
+          return this.settleDisputeFromProviderStatus(d, known.status);
+        }
+        await this.applyDisputePayoutOutcome(d.reference, 'FAILED', 'dispatch-rejected');
+        return this.readDisputePayoutStatus(d.disputeId);
+      }
+
+      // UNKNOWN (timeout / 5xx / network): a transfer MAY exist. Do not retry, do not mark failed,
+      // do not mark paid. A webhook or the reconciliation sweep resolves it.
+      return DisputePayoutStatus.PAYOUT_PENDING;
+    }
+
+    return this.settleDisputeFromProviderStatus(d, transfer.status, transfer.simulated);
+  }
+
+  private async settleDisputeFromProviderStatus(
+    d: DisputePayoutDispatch,
+    status: string | undefined,
+    simulated?: boolean,
+  ): Promise<DisputePayoutStatus> {
+    const verdict = this.classifyTransferStatus(status, simulated);
+
+    if (verdict === 'SUCCESS') {
+      if (simulated) {
+        this.logger.warn(
+          `Dispute #${d.disputeId}: payout ${d.reference} was SIMULATED (sandbox mode). No real money moved.`,
+        );
+      }
+      await this.applyDisputePayoutOutcome(d.reference, 'SUCCESS', 'dispatch-response');
+      return this.readDisputePayoutStatus(d.disputeId);
+    }
+
+    if (verdict === 'FAILED') {
+      await this.applyDisputePayoutOutcome(d.reference, 'FAILED', 'dispatch-response');
+      return this.readDisputePayoutStatus(d.disputeId);
+    }
+
+    if (String(status ?? '').toLowerCase() === 'otp') {
+      this.logger.error(
+        `Dispute #${d.disputeId}: transfer ${d.reference} is waiting for OTP approval at the provider and will NOT be sent ` +
+          'until approved. Disable transfer OTP for automated payouts. It stays PAYOUT_PENDING.',
+      );
+    }
+    return DisputePayoutStatus.PAYOUT_PENDING;
+  }
+
+  private async readDisputePayoutStatus(disputeId: string): Promise<DisputePayoutStatus> {
+    const row = await this.dataSource
+      .getRepository(Dispute)
+      .findOne({ where: { id: disputeId }, select: { id: true, payoutStatus: true } });
+    return row?.payoutStatus ?? DisputePayoutStatus.PAYOUT_PENDING;
+  }
+
+  // Idempotent. Replays and out-of-order events change nothing.
+  private async applyDisputePayoutOutcome(
+    reference: string,
+    outcome: 'SUCCESS' | 'FAILED',
+    source: string,
+  ): Promise<{ matched: boolean; applied: boolean; message: string }> {
+    const result = await this.dataSource.transaction(async (manager) => {
+      const dispute = await manager.findOne(Dispute, {
+        where: { payoutReference: reference },
+        lock: { mode: 'pessimistic_write' },
+      });
+
+      if (!dispute) {
+        return { matched: false, applied: false, message: 'No matching dispute or escrow for transfer reference', disputeId: null as string | null };
+      }
+
+      if (outcome === 'SUCCESS') {
+        if (dispute.payoutStatus === DisputePayoutStatus.RELEASED) {
+          return { matched: true, applied: false, message: 'Transfer already confirmed (idempotent)', disputeId: dispute.id };
+        }
+        if (dispute.payoutStatus !== DisputePayoutStatus.PAYOUT_PENDING) {
+          this.logger.warn(
+            `Dispute #${dispute.id}: provider confirmed ${reference} (${source}) while payout was ${dispute.payoutStatus}. Money moved, so recording it.`,
+          );
+        }
+        dispute.payoutStatus = DisputePayoutStatus.RELEASED;
+        await manager.save(Dispute, dispute);
+        return { matched: true, applied: true, message: `Dispute transfer ${reference} confirmed`, disputeId: dispute.id };
+      }
+
+      // outcome === 'FAILED'
+      if (dispute.payoutStatus !== DisputePayoutStatus.PAYOUT_PENDING) {
+        this.logger.error(
+          `Dispute #${dispute.id}: provider reported ${reference} failed/reversed (${source}) but payout is ${dispute.payoutStatus}. ` +
+            'No state change. If money was actually returned to the provider balance, an operator must review.',
+        );
+        return { matched: true, applied: false, message: 'Ignored: dispute payout is not awaiting a result', disputeId: dispute.id };
+      }
+      dispute.payoutStatus = DisputePayoutStatus.PAYOUT_FAILED;
+      await manager.save(Dispute, dispute);
+      return { matched: true, applied: true, message: `Dispute transfer ${reference} marked as PAYOUT_FAILED`, disputeId: dispute.id };
+    });
+
+    if (result.applied && outcome === 'FAILED' && result.disputeId) {
+      this.logger.error(
+        `Dispute #${result.disputeId} artisan payout FAILED (${source}). Retry with PATCH /disputes/${result.disputeId}/retry-payout.`,
+      );
+    }
+    return { matched: result.matched, applied: result.applied, message: result.message };
+  }
+
+  // Admin: re-dispatch a dispute payout that conclusively failed, with a fresh provider reference.
+  async retryDisputePayout(disputeId: string) {
+    const current = await this.dataSource.getRepository(Dispute).findOneBy({ id: disputeId });
+    if (!current) {
+      throw new NotFoundException('Dispute ticket not found');
+    }
+    if (current.status !== DisputeStatus.RESOLVED) {
+      throw new BadRequestException('Only a resolved dispute has a payout to retry');
+    }
+    if (current.payoutStatus === DisputePayoutStatus.RELEASED) {
+      throw new BadRequestException('The artisan payout for this dispute has already been paid');
+    }
+    if (current.payoutStatus === DisputePayoutStatus.PAYOUT_PENDING) {
+      throw new BadRequestException(
+        'The artisan payout is still awaiting provider confirmation. Run payout reconciliation instead of retrying.',
+      );
+    }
+    if (current.payoutStatus !== DisputePayoutStatus.PAYOUT_FAILED) {
+      throw new BadRequestException('This dispute has no failed artisan payout to retry');
+    }
+
+    const escrow = await this.escrowRepository.findOneBy({ id: current.escrowId });
+    if (!escrow) {
+      throw new NotFoundException('Associated escrow not found');
+    }
+
+    // Never pay twice: if the old transfer actually exists at the provider, trust the provider.
+    if (current.payoutReference) {
+      const known = await this.paymentsService
+        .verifyTransfer(current.payoutReference, escrow.currency)
+        .catch(() => null);
+      if (known?.found) {
+        const verdict = this.classifyTransferStatus(known.status);
+        if (verdict === 'SUCCESS') {
+          await this.applyDisputePayoutOutcome(current.payoutReference, 'SUCCESS', 'retry-check');
+          return {
+            message: 'The original transfer had already succeeded at the provider. Recorded as paid; nothing was re-sent.',
+            payoutStatus: DisputePayoutStatus.RELEASED,
+            payoutReference: current.payoutReference,
+          };
+        }
+        if (verdict === 'PENDING') {
+          throw new BadRequestException(
+            'The original transfer is still being processed by the provider. Run payout reconciliation instead of retrying.',
+          );
+        }
+      }
+    }
+
+    // Phase 1 again: fresh reference + PAYOUT_PENDING committed before the provider is contacted.
+    const dispatch = await this.dataSource.transaction(async (manager): Promise<DisputePayoutDispatch> => {
+      const dispute = await manager.findOne(Dispute, {
+        where: { id: disputeId },
+        lock: { mode: 'pessimistic_write' },
+      });
+      if (
+        !dispute ||
+        dispute.status !== DisputeStatus.RESOLVED ||
+        dispute.payoutStatus !== DisputePayoutStatus.PAYOUT_FAILED
+      ) {
+        throw new BadRequestException('The dispute payout state changed. Please refresh and try again.');
+      }
+
+      const artisan = escrow.artisanId ? await manager.findOneBy(User, { id: escrow.artisanId }) : null;
+      if (!artisan?.payoutRecipientCode) {
+        throw new BadRequestException(
+          'The artisan has not set up their payout account yet. Ask them to add their bank details first.',
+        );
+      }
+
+      const amountMinor = this.toMinor(dispute.artisanPayoutAmount);
+      if (amountMinor <= 0) {
+        throw new BadRequestException('This dispute has no artisan payout amount to retry');
+      }
+
+      const reference = this.nextTransferRef(
+        `${DISPUTE_PAYOUT_REF_PREFIX}${dispute.id}`,
+        dispute.payoutReference,
+      );
+      dispute.payoutStatus = DisputePayoutStatus.PAYOUT_PENDING;
+      dispute.payoutReference = reference;
+      dispute.payoutDispatchedAt = null;
+      await manager.save(Dispute, dispute);
+
+      return {
+        disputeId: dispute.id,
+        escrowId: escrow.id,
+        amountMinor,
+        recipientCode: artisan.payoutRecipientCode,
+        reference,
+        reason: `Tark Dispute Settlement: Job #${escrow.jobId.slice(0, 8)}`,
+        currency: escrow.currency,
+      };
+    });
+
+    const payoutStatus = await this.dispatchDisputePayout(dispatch);
+    return {
+      message:
+        payoutStatus === DisputePayoutStatus.RELEASED
+          ? 'Artisan payout confirmed by the provider.'
+          : payoutStatus === DisputePayoutStatus.PAYOUT_FAILED
+            ? 'The provider declined the retry. No money was sent. You can try again.'
+            : 'Retry dispatched. Awaiting provider confirmation.',
+      payoutStatus,
+      payoutReference: dispatch.reference,
+    };
+  }
+
+  // Sweep for dispute payouts still PAYOUT_PENDING (same rules as the escrow sweep).
+  private async reconcilePendingDisputePayouts(summary: ReconcileSummary, cutoff: Date, grace: number) {
+    const rows = await this.dataSource.getRepository(Dispute).find({
+      where: { payoutStatus: DisputePayoutStatus.PAYOUT_PENDING, updatedAt: LessThan(cutoff) },
+    });
+
+    for (const row of rows) {
+      summary.checked++;
+      const reference = row.payoutReference;
+      if (!reference) {
+        this.logger.error(`Dispute #${row.id} is PAYOUT_PENDING but has no transfer reference. Needs an operator.`);
+        summary.errors++;
+        continue;
+      }
+
+      try {
+        const escrow = await this.escrowRepository.findOneBy({ id: row.escrowId });
+        const verified = await this.paymentsService.verifyTransfer(reference, escrow?.currency || 'NGN');
+
+        if (!verified.found) {
+          const ageSeconds = (Date.now() - new Date(row.updatedAt).getTime()) / 1000;
+          if (ageSeconds >= grace) {
+            this.logger.warn(`Dispute #${row.id}: provider has no record of ${reference} after ${Math.round(ageSeconds)}s. Marking PAYOUT_FAILED (retryable).`);
+            await this.applyDisputePayoutOutcome(reference, 'FAILED', 'reconciliation-not-found');
+            summary.reverted++;
+          } else {
+            summary.stillPending++;
+          }
+          continue;
+        }
+
+        const verdict = this.classifyTransferStatus(verified.status);
+        if (verdict === 'SUCCESS') {
+          await this.applyDisputePayoutOutcome(reference, 'SUCCESS', 'reconciliation');
+          summary.settled++;
+        } else if (verdict === 'FAILED') {
+          await this.applyDisputePayoutOutcome(reference, 'FAILED', 'reconciliation');
+          summary.failed++;
+        } else {
+          summary.stillPending++;
+        }
+      } catch (err: any) {
+        this.logger.error(`Reconciliation of dispute payout ${reference} failed: ${err?.message}`);
+        summary.errors++;
+      }
+    }
   }
 
   // Asks the provider about every payout still PAYOUT_PENDING and applies the answer.
@@ -578,6 +895,8 @@ export class EscrowService implements OnModuleInit, OnModuleDestroy {
           summary.errors++;
         }
       }
+
+      await this.reconcilePendingDisputePayouts(summary, cutoff, grace);
 
       if (summary.checked > 0) {
         this.logger.log(`Payout reconciliation: ${JSON.stringify(summary)}`);
@@ -678,9 +997,9 @@ export class EscrowService implements OnModuleInit, OnModuleDestroy {
       throw new BadRequestException(`Cannot create escrow: ${tranche1PolicyMessage()}`);
     }
 
-    const totalBudget = Number(job.tranche1Amount) + Number(job.tranche2Amount);
-    // 5% Tark Protocol Fee (calculated on total job budget, retained by platform upon settlement)
-    const platformFee = Math.round(totalBudget * 0.05 * 100) / 100;
+    // 5% Tark Protocol Fee (calculated in integer kobo on total job budget, retained upon settlement)
+    const feeMinor = Math.round((totalBudgetMinor * 5) / 100);
+    const platformFee = feeMinor / 100;
 
     const escrow = escrowRepo.create({
       jobId: job.id,

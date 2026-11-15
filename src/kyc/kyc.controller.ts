@@ -10,6 +10,7 @@ import {
   Request,
   HttpCode,
   HttpStatus,
+  ParseUUIDPipe,
 } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
@@ -19,6 +20,7 @@ import { KycService } from './kyc.service';
 import { SubmitKycDto } from './dto/submit-kyc.dto';
 import { RejectKycDto } from './dto/reject-kyc.dto';
 import { QueryKycDto } from './dto/query-kyc.dto';
+import { VerifiedScopeDto } from './dto/verified-scope.dto';
 
 @Controller('kyc')
 @UseGuards(JwtAuthGuard)
@@ -84,8 +86,26 @@ export class KycController {
   @Patch('admin/:id/approve')
   @UseGuards(RolesGuard)
   @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
-  async approveKyc(@Request() req: any, @Param('id') id: string) {
-    return this.kycService.approveKyc(id, req.user.userId);
+  async approveKyc(
+    @Request() req: any,
+    @Param('id') id: string,
+    @Body() dto?: VerifiedScopeDto,
+  ) {
+    return this.kycService.approveKyc(id, req.user.userId, dto ?? {});
+  }
+
+  /**
+   * Admin sets/updates an artisan's verified trade categories and service area.
+   */
+  @Patch('admin/artisans/:userId/scope')
+  @UseGuards(RolesGuard)
+  @Roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
+  async updateVerifiedScope(
+    @Request() req: any,
+    @Param('userId', new ParseUUIDPipe()) userId: string,
+    @Body() dto: VerifiedScopeDto,
+  ) {
+    return this.kycService.updateVerifiedScope(userId, dto ?? {}, req.user.userId);
   }
 
   /**

@@ -7,11 +7,13 @@ import { KycService } from './kyc.service';
 import { KycController } from './kyc.controller';
 import { KycTriageService } from './services/kyc-triage.service';
 import { NotificationsModule } from '../notifications/notifications.module';
+import { CategoriesModule } from '../categories/categories.module';
 
 @Module({
   imports: [
     TypeOrmModule.forFeature([KycRecord, User]),
     ConfigModule,
+    CategoriesModule,
     forwardRef(() => NotificationsModule),
   ],
   controllers: [KycController],

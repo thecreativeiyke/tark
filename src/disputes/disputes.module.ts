@@ -8,6 +8,7 @@ import { Job } from '../jobs/entities/job.entity';
 import { User } from '../users/entities/user.entity';
 import { AuthModule } from '../auth/auth.module';
 import { PaymentsModule } from '../payments/payments.module';
+import { EscrowModule } from '../escrow/escrow.module';
 import { NotificationsModule } from '../notifications/notifications.module';
 
 @Module({
@@ -15,6 +16,7 @@ import { NotificationsModule } from '../notifications/notifications.module';
     TypeOrmModule.forFeature([Dispute, EscrowTransaction, Job, User]),
     AuthModule,
     PaymentsModule,
+    EscrowModule,
     NotificationsModule,
   ],
   controllers: [DisputesController],

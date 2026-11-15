@@ -2,6 +2,7 @@ import {
   Injectable,
   UnauthorizedException,
   BadRequestException,
+  Logger,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import * as bcrypt from 'bcryptjs';
@@ -17,8 +18,25 @@ import { ConfigService } from '@nestjs/config';
 const DUMMY_HASH =
   '$2a$10$abcdefghijklmnopqrstuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu';
 
+/** Helper to safely escape user text inside HTML email templates */
+function escapeHtml(str: string): string {
+  return (str || '').replace(
+    /[&<>"']/g,
+    (m) =>
+      ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#39;',
+      })[m] || m,
+  );
+}
+
 @Injectable()
 export class AuthService {
+  private readonly logger = new Logger(AuthService.name);
+
   constructor(
     private usersService: UsersService,
     private jwtService: JwtService,
@@ -58,38 +76,56 @@ export class AuthService {
     const user = await this.usersService.findByEmail(normalizedEmail);
 
     if (user) {
-      // 32-byte random token; store only its SHA-256 hash in the DB
-      const rawToken = crypto.randomBytes(32).toString('hex');
-      const tokenHash = crypto
-        .createHash('sha256')
-        .update(rawToken)
-        .digest('hex');
+      // Per-account cooldown: don't dispatch another reset email if one was requested in the last 60 seconds
+      const now = Date.now();
+      const lastExpiry = user.passwordResetExpiresAt
+        ? new Date(user.passwordResetExpiresAt).getTime()
+        : 0;
+      const isCooldownActive = lastExpiry - now > 29 * 60 * 1000;
 
-      const expiresAt = new Date(Date.now() + 30 * 60 * 1000); // 30 minutes
+      if (!isCooldownActive) {
+        // 32-byte random token; store only its SHA-256 hash in the DB
+        const rawToken = crypto.randomBytes(32).toString('hex');
+        const tokenHash = crypto
+          .createHash('sha256')
+          .update(rawToken)
+          .digest('hex');
 
-      await this.usersService.setPasswordResetToken(user.id, tokenHash, expiresAt);
+        const expiresAt = new Date(now + 30 * 60 * 1000); // 30 minutes
 
-      const appUrl =
-        this.configService.get<string>('APP_URL') ?? 'https://tark.ng';
-      const resetLink = `${appUrl}/reset-password?token=${rawToken}`;
+        await this.usersService.setPasswordResetToken(user.id, tokenHash, expiresAt);
 
-      await this.notificationsService.dispatch({
-        userId: user.id,
-        type: NotificationType.PASSWORD_RESET,
-        title: 'Password Reset Request',
-        message:
-          'You requested a password reset. The link expires in 30 minutes. If you did not request this, ignore this message.',
-        email: {
-          subject: 'Tark – Reset your password',
-          html: `
-            <p>Hi ${user.fullName || 'there'},</p>
-            <p>Click the link below to reset your Tark password. It is valid for <strong>30 minutes</strong>.</p>
-            <p><a href="${resetLink}" style="color:#4f46e5">Reset Password</a></p>
-            <p>If you did not request a password reset, you can safely ignore this email.</p>
-            <p>— The Tark Team</p>
-          `,
-        },
-      });
+        const appUrl =
+          this.configService.get<string>('APP_URL') ?? 'https://tark.ng';
+        const resetLink = `${appUrl}/reset-password?token=${rawToken}`;
+        const safeName = escapeHtml(user.fullName || 'there');
+
+        // Fire-and-forget: the response must not wait on mail delivery, otherwise registered
+        // emails take measurably longer than unknown ones (timing-based enumeration).
+        this.notificationsService
+          .dispatch({
+            userId: user.id,
+            type: NotificationType.PASSWORD_RESET,
+            title: 'Password Reset Request',
+            message:
+              'You requested a password reset. The link expires in 30 minutes. If you did not request this, ignore this message.',
+            email: {
+              subject: 'Tark – Reset your password',
+              html: `
+              <p>Hi ${safeName},</p>
+              <p>Click the link below to reset your Tark password. It is valid for <strong>30 minutes</strong>.</p>
+              <p><a href="${resetLink}" style="color:#4f46e5">Reset Password</a></p>
+              <p>If you did not request a password reset, you can safely ignore this email.</p>
+              <p>— The Tark Team</p>
+            `,
+            },
+          })
+          .catch((err: any) =>
+            this.logger.error(
+              `Password reset notification failed for user ${user.id}: ${err?.message}`,
+            ),
+          );
+      }
     }
 
     // Always identical response — no email enumeration possible
@@ -101,7 +137,7 @@ export class AuthService {
 
   /**
    * Step 2 of password reset.
-   * Validates token, updates password, invalidates all existing sessions.
+   * Atomically validates token, updates password, and revokes all sessions in a single DB query.
    */
   async resetPassword(
     token: string,
@@ -112,23 +148,17 @@ export class AuthService {
     }
 
     const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
-    const user = await this.usersService.findByPasswordResetTokenHash(tokenHash);
-
-    if (
-      !user ||
-      !user.passwordResetExpiresAt ||
-      user.passwordResetExpiresAt < new Date()
-    ) {
-      // Same message for "not found" and "expired" — prevents oracle attacks
-      throw new BadRequestException('Invalid or expired reset token.');
-    }
-
     const hashedPassword = await bcrypt.hash(newPassword, 10);
 
-    // Order matters: update password → clear token → bump tokenVersion (revokes all sessions)
-    await this.usersService.updatePassword(user.id, hashedPassword);
-    await this.usersService.clearPasswordResetToken(user.id);
-    await this.usersService.incrementTokenVersion(user.id);
+    const success = await this.usersService.resetPasswordAtomic(
+      tokenHash,
+      hashedPassword,
+    );
+
+    if (!success) {
+      // Same message for "not found", "already used", and "expired"
+      throw new BadRequestException('Invalid or expired reset token.');
+    }
 
     return {
       message: 'Password reset successfully. Please log in again.',

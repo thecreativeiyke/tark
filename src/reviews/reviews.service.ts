@@ -9,6 +9,8 @@ import { Repository } from 'typeorm';
 import { Review, ReviewStatus } from './entities/review.entity';
 import { CreateReviewDto } from './dto/create-review.dto';
 import { ModerateReviewDto } from './dto/moderate-review.dto';
+import { QueryArtisanReviewsDto } from './dto/query-artisan-reviews.dto';
+import { decodeCursor, encodeCursor } from '../jobs/jobs.utils';
 import { Job, JobStatus } from '../jobs/entities/job.entity';
 import { User } from '../users/entities/user.entity';
 
@@ -72,15 +74,51 @@ export class ReviewsService {
 
   // ─────────────────────────────────────────────────────────────────────
   // PUBLIC ARTISAN REVIEWS: Anyone can see verified, approved reviews.
+  // Strict allowlist projection + keyset pagination (createdAt DESC, id DESC).
   // ─────────────────────────────────────────────────────────────────────
-  async getPublicArtisanReviews(artisanId: string) {
-    return this.reviewsRepository.find({
-      where: {
-        artisanId,
-        status: ReviewStatus.APPROVED,
-      },
-      order: { createdAt: 'DESC' },
-    });
+  async getPublicArtisanReviews(artisanId: string, query: QueryArtisanReviewsDto = {}) {
+    const limit = query.limit ?? 20;
+
+    const qb = this.reviewsRepository
+      .createQueryBuilder('review')
+      .addSelect('CAST(review.createdAt AS text)', 'cursor_ts')
+      .where('review.artisanId = :artisanId', { artisanId })
+      .andWhere('review.status = :status', { status: ReviewStatus.APPROVED });
+
+    if (query.cursor) {
+      const c = decodeCursor(query.cursor);
+      qb.andWhere(
+        '("review"."createdAt", "review"."id") < (CAST(:curTs AS timestamp), CAST(:curId AS uuid))',
+        { curTs: c.ts, curId: c.id },
+      );
+    }
+
+    qb.orderBy('review.createdAt', 'DESC').addOrderBy('review.id', 'DESC').limit(limit + 1);
+
+    const { entities, raw } = await qb.getRawAndEntities();
+    const hasMore = entities.length > limit;
+    const items = entities.slice(0, limit);
+    const last = items[items.length - 1];
+    const nextCursor =
+      hasMore && last
+        ? encodeCursor({ ts: raw[items.length - 1].cursor_ts, id: last.id })
+        : null;
+
+    return {
+      data: items.map((review) => this.toPublicReview(review)),
+      meta: { limit, hasMore, nextCursor },
+    };
+  }
+
+  /** Never spread the entity: adminNotes, moderatedBy, clientId, jobId etc. must not leak. */
+  private toPublicReview(review: Review) {
+    return {
+      id: review.id,
+      rating: review.rating,
+      comment: review.comment,
+      proofMediaUrls: review.proofMediaUrls ?? [],
+      createdAt: review.createdAt,
+    };
   }
 
   // ─────────────────────────────────────────────────────────────────────

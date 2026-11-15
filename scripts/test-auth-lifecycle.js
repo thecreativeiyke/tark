@@ -99,6 +99,21 @@ async function run() {
     assert(meRes.status === 200, `Initial token authenticates /auth/me (status ${meRes.status})`);
     assert(meRes.body.id === testUserId, 'Initial token maps to correct user id');
 
+    // Verify password length cap (max 72 chars to prevent bcrypt CPU DoS)
+    const longPassRes = await request('/auth/register', {
+      method: 'POST',
+      body: {
+        email: `longpass.${ts}@tark.ng`,
+        password: 'A'.repeat(73),
+        fullName: 'Long Pass User',
+        role: 'client',
+      },
+    });
+    assert(
+      longPassRes.status === 400,
+      `Registration with >72 char password rejected with 400 Bad Request (got ${longPassRes.status})`,
+    );
+
     // -----------------------------------------------------------------
     // Step 2: Test Case-Insensitive Email Collision
     // -----------------------------------------------------------------

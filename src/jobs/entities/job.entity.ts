@@ -5,6 +5,7 @@ import {
   CreateDateColumn,
   UpdateDateColumn,
   DeleteDateColumn,
+  Index,
 } from 'typeorm';
 
 export enum JobStatus {
@@ -15,6 +16,9 @@ export enum JobStatus {
   CANCELLED = 'CANCELLED',
 }
 
+@Index('IDX_job_clientId', ['clientId'])
+@Index('IDX_job_artisanId', ['artisanId'])
+@Index('IDX_job_status_category_createdAt', ['status', 'category', 'createdAt'])
 @Entity()
 export class Job {
   @PrimaryGeneratedColumn('uuid')
@@ -43,6 +47,10 @@ export class Job {
 
   @Column()
   location: string;
+
+  // Normalized coarse area (city level), derived server-side from `location`.
+  @Column({ type: 'varchar', length: 64, nullable: true })
+  areaCode: string | null;
 
   @Column({ type: 'double precision', nullable: true })
   latitude: number;

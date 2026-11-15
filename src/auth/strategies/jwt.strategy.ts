@@ -33,6 +33,7 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
     if ((payload.tv ?? 0) !== user.tokenVersion) {
       throw new UnauthorizedException('Session expired. Please log in again.');
     }
-    return { userId: payload.sub, email: payload.email, role: payload.role };
+    // Return live attributes from the database record, ensuring immediate effect of role changes/demotions
+    return { userId: user.id, email: user.email, role: user.role };
   }
 }
