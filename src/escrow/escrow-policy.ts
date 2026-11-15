@@ -4,6 +4,9 @@
 // already loaded by ConfigModule. All comparisons are done in integer minor units
 // (kobo) so there is no floating-point slop at the exact boundaries.
 
+import { toMinorUnits } from '../common/currency';
+export { toMinorUnits };
+
 export function tranche1Bounds(): { min: number; max: number } {
   const rawMin = Number(process.env.TRANCHE1_MIN_PCT ?? 30);
   const rawMax = Number(process.env.TRANCHE1_MAX_PCT ?? 50);
@@ -12,9 +15,7 @@ export function tranche1Bounds(): { min: number; max: number } {
   return { min, max };
 }
 
-export function toMinorUnits(amount: number | string): number {
-  return Math.round(Number(amount) * 100);
-}
+
 
 /** True when Tranche 1 is within the allowed share of the total (inclusive bounds). */
 export function isTranche1Compliant(tranche1Minor: number, totalMinor: number): boolean {

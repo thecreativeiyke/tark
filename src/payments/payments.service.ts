@@ -70,7 +70,19 @@ export class PaymentsService {
 
   // Real-time Third-Party Bank API Directory
   async getSupportedBanks(filters: BankFilterQuery = {}) {
-    const { country = 'nigeria', currency = 'NGN', type = 'nuban', search } = filters;
+    const currency = (filters.currency || 'NGN').toUpperCase();
+    const defaultCountryForCurrency: Record<string, string> = {
+      NGN: 'nigeria',
+      GHS: 'ghana',
+      ZAR: 'south-africa',
+      KES: 'kenya',
+    };
+    const country =
+      filters.country?.toLowerCase() ||
+      defaultCountryForCurrency[currency] ||
+      'nigeria';
+    const type = filters.type || (currency === 'NGN' ? 'nuban' : undefined);
+    const search = filters.search;
 
     try {
       const response = await axios.get(

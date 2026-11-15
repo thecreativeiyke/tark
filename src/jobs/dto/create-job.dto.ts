@@ -4,7 +4,10 @@ import {
   IsOptional,
   IsArray,
   Min,
+  IsIn,
 } from 'class-validator';
+import { Transform } from 'class-transformer';
+import { SUPPORTED_CURRENCIES } from '../../common/currency';
 
 export class CreateJobDto {
   @IsString()
@@ -17,7 +20,12 @@ export class CreateJobDto {
   category: string;
 
   @IsOptional()
-  @IsString()
+  @Transform(({ value }) =>
+    typeof value === 'string' ? value.trim().toUpperCase() : value,
+  )
+  @IsIn([...SUPPORTED_CURRENCIES], {
+    message: `currency must be one of: ${SUPPORTED_CURRENCIES.join(', ')}`,
+  })
   currency?: string;
 
   @IsNumber()
