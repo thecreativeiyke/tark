@@ -36,6 +36,62 @@
 
 ## 🗓️ Session Log
 
+### 🗓️ 2026-11-15 — Session 16: Claude Audit Response, Full Re-Verification & Auth Lifecycle Hardening
+- **Author**: Lead Engineer (AI Model: Antigravity / Gemini) & Ikechukwu Alaeto (Founder)
+- **Tag**: `[AUDIT]` `[FLAGGED & FIXED]` — Full rationale in Phase 11 amendment of [ADR 009](./docs/adr/009-security-hardening-phase1-phase2.md)
+- **Commit**: `8c72229` (already on main — all fixes shipped in the same commit as Phase 2)
+
+#### 🎯 Purpose of This Session:
+An adversarial static review by Claude identified 12 categories of real defects. We re-verified every claim line by line against the actual committed code, confirmed all fixes are present in `8c72229`, rebuilt, restarted, and re-ran all five live red-team suites. See ADR 009 Phase 11 for the full finding-by-finding disposition.
+
+#### ✅ Verification Results (run 2026-11-15, server on `localhost:3000`, Supabase):
+- `npx tsc --noEmit` → **0 errors**
+- `npm run build` → **clean**
+- `node scripts/test-auth-lifecycle.js` → **ALL PASSED** (forgot/reset/change-password, tokenVersion revocation, case-collision guard, >72-char password rejection)
+- `node scripts/redteam-active-hack-phase1.js` → **5/5 attacks 100% repelled**
+- `node scripts/redteam-active-hack-phase2.js` → **8/8 attacks 100% repelled**
+- `node scripts/test-kyc-url-validation.js` → **ALL PASSED** (3 hostile + 1 valid)
+- `node scripts/test-upload-magic-bytes.js` → **41/41 checks passed**
+
+#### 🔍 Claude Audit — Summary of Findings vs Code Reality:
+
+| # | Finding | Valid? | Status in `8c72229` |
+|---|---------|--------|---------------------|
+| 1 | Disputes & payouts collide (PAYOUT_PENDING + DISPUTED race) | ✅ | Fixed: `create()` takes `pessimistic_write` lock first; blocks if `tranche1Status/tranche2Status === PAYOUT_PENDING` |
+| 2 | Dispute payout inside DB transaction (skips two-phase) | ✅ | Fixed: `resolve()` Phase 2 Paystack call is after `dataSource.transaction()` commit |
+| 3 | Dispute refunds ignore currency; tranche labeling wrong | ✅ | Fixed: NGN wallet-refund guard; only non-RELEASED tranches marked REFUNDED |
+| 4 | resetPassword not atomic (3 separate writes, concurrent race) | ✅ | Fixed: `resetPasswordAtomic()` single-query UPDATE … WHERE tokenHash = ? AND expiresAt > NOW() |
+| 5 | forgotPassword: HTML injection, email-bombing, timing | ✅ | Fixed: `escapeHtml()` on `safeName`; 60-second per-account cooldown; fire-and-forget email dispatch |
+| 6 | Email collision race returns 500 instead of 409 | ✅ | Fixed: `create()` catches PostgreSQL `23505` → `ConflictException` |
+| 7 | KYC approve/reject has no status guard | ✅ | Fixed: status + self-review guards in `approveKyc()` and `rejectKyc()` |
+| 8 | KYC signed access token is inert HMAC with hardcoded fallback | ✅ | Fixed: `getSecureDocumentAccess()` returns `{ targetUrl, sha256, docType }` only — no fake token |
+| 9 | Wallet top-up uses float arithmetic | ✅ | Fixed: integer kobo arithmetic in webhook handler |
+| 10 | 5% platform fee computed in float | ✅ | Fixed: `Math.round((totalBudgetMinor * 5) / 100) / 100` |
+| 11 | JWT strategy returns stale role from token claims | ✅ | Fixed: `JwtStrategy.validate()` returns live DB `user.role` |
+| 12 | CORS reflects all origins; unlimited password; Supabase ref in .env.example | ✅ | Fixed: allowlist CORS (`CORS_ALLOWED_ORIGINS`), `@MaxLength(72)` on all password DTOs, placeholder in `.env.example` |
+
+#### 📝 Claude Overclaims (documentation corrections, no code changes required):
+- Documented transfer refs are `tark-t1-` / `tark-final-` (not `tark-t2-` as Claude noted in one audit pass)
+- The wallet ledger is single-entry, not "double-entry accounting" as described in some prior docs
+- Handshake PIN IS in the email template — this is intentional per the product design
+
+#### 📋 Auth DTOs — Current State (all wired & tested):
+- `POST /auth/register` → `RegisterDto` (`@MaxLength(72)` on password)
+- `POST /auth/login` → `LoginDto` (`@MaxLength(72)` on password)
+- `POST /auth/forgot-password` → `ForgotPasswordDto` (lowercase transform, non-enumerating)
+- `POST /auth/reset-password` → `ResetPasswordDto` (`@MaxLength(72)` on `newPassword`)
+- `POST /auth/change-password` → `ChangePasswordDto` (`@MaxLength(72)` on both)
+- `GET /auth/me` → `JwtAuthGuard` (returns live DB profile, no password)
+
+All five endpoints are rate-throttled (5–10 req/min per IP).
+
+#### 📜 Open / Next:
+1. **Multi-currency architecture (Phase 10/11)**: NGN, USD, GHS, ZAR — multi-wallet ledger per currency, `toMinorUnits` utility, Paystack vs Stripe routing, `CreateJobDto.currency` validation. See ADR 009 Phase 11 for design decisions.
+2. **Stale `.save()` races on profile update**: `UsersService.updateProfile()` uses `Object.assign + save()` — should use `update()` with an explicit field list to prevent wallet/security-field overwrites.
+3. **Money correctness test suite**: an automated end-to-end test for the full escrow journey (fund → T1 release → proof → handshake → settle) using Paystack sandbox.
+
+---
+
 ### 🗓️ 2026-11-15 — Session 15: Phase 2 — Verified Artisan Scope, Discovery/Teaser/Side-Door Lockdown, Reviews & Nearby Hardening
 - **Author**: Claude (via Claude Desktop + Filesystem extension) & the Founder
 - **Tag**: `[SHIPPED]` & `[DECISION]` — Full rationale in the Phase 10 amendment of [ADR 009](./docs/adr/009-security-hardening-phase1-phase2.md)

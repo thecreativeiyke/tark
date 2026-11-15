@@ -362,3 +362,125 @@ After Phases 1–9 the job and reputation read paths still leaked or over-truste
   - The database was cleaned after the run: all test accounts and child rows removed, keeping only the `super_admin` account and the static `category` lookup rows.
   - Operational note: `/jobs/teaser` is throttled to 10 requests per minute per IP and the script calls it once, so wait about 60 seconds after any load test before running it.
 
+
+---
+
+## Amendment: Phase 11 — Claude Adversarial Audit Response & Auth Lifecycle Hardening (2026-11-15)
+
+### Context
+
+An independent adversarial static review by Claude identified 12 categories of real defects spanning dispute/payout concurrency, password reset atomicity, HTML injection, KYC guard gaps, CORS misconfiguration, float arithmetic in money paths, and stale JWT claims. All 12 were investigated against the committed code (commit `8c72229`). Ten were genuine and already committed; two required documentation corrections but no code changes.
+
+Additionally, the auth module was reviewed for missing password-management DTOs and endpoints. All five auth flows (`register`, `login`, `forgot-password`, `reset-password`, `change-password`) were confirmed wired with correct throttling and validation.
+
+### Decisions
+
+#### A. Dispute / Payout Isolation (Claude finding #1 & #2)
+
+**Payout-dispute collision guard** — `DisputesService.create()` now:
+1. Takes a `pessimistic_write` lock on the escrow row *before* any status check.
+2. Throws `400 Bad Request` if `tranche1Status` or `tranche2Status` is `PAYOUT_PENDING` ("transfer in-flight").
+3. Checks for an existing open dispute record *under the same lock* (prevents two concurrent dispute creations).
+
+**Two-phase dispute payout** — `DisputesService.resolve()` now:
+- Phase 1 (inside `dataSource.transaction()`): sets escrow `PAYOUT_PENDING`, commits the deterministic reference (`tark-dispute-{disputeId}`), saves all DB state.
+- Phase 2 (after commit, outside the transaction): dispatches the Paystack transfer via `escrowService.dispatchDisputePayout()`. Ambiguous outcomes (timeout, 5xx) leave the dispute in `PAYOUT_PENDING` for the reconciliation sweep; only `transfer.success` moves it to `RELEASED`.
+
+#### B. Tranche Labeling & Currency Guard (Claude finding #3)
+
+- In `resolve()`, only tranches whose `tranche1Status` / `tranche2Status` are **not already `RELEASED`** are labeled `REFUNDED`. Tranches that were already paid out are preserved correctly.
+- A guard throws `400 Bad Request` if `clientRefundMinor > 0` and `escrow.currency !== 'NGN'`—non-NGN refunds cannot be credited to the NGN in-app wallet.
+
+#### C. Atomic Password Reset (Claude finding #4)
+
+`UsersService.resetPasswordAtomic(tokenHash, hashedPassword)` performs a single atomic SQL UPDATE:
+```sql
+UPDATE "user"
+SET password = $1,
+    "passwordResetTokenHash" = NULL,
+    "passwordResetExpiresAt" = NULL,
+    "tokenVersion" = "tokenVersion" + 1
+WHERE "passwordResetTokenHash" = $2
+  AND "passwordResetExpiresAt" > NOW()
+```
+Returns `true` only if `affected > 0`. Two concurrent requests with the same token: the first succeeds, the second finds no matching row and fails. No intermediate state is observable.
+
+#### D. forgotPassword Hardening (Claude finding #5)
+
+- `escapeHtml()` applied to `user.fullName` before interpolation into the HTML email body.
+- **Per-account cooldown**: a new reset email is only dispatched if `passwordResetExpiresAt - now < 29 minutes` (i.e., the existing token has less than 29 of its 30 minutes remaining). Re-requesting during the first 60 seconds is silently swallowed. This prevents email-bombing a victim.
+- Mail dispatch is **fire-and-forget** (`.catch()` logging, response does not wait on SMTP): a registered email cannot be distinguished from an unknown one by response timing.
+
+#### E. Email Collision Race → 409 (Claude finding #6)
+
+`UsersService.create()` wraps `repository.save()` in a try/catch that converts PostgreSQL error code `23505` (unique-violation) to `ConflictException (409)` instead of leaking an unhandled 500.
+
+#### F. KYC Status & Self-Review Guards (Claude finding #7)
+
+- `approveKyc()` and `rejectKyc()` both throw `BadRequestException` if the record is not in `PENDING_REVIEW` or `RESUBMITTED` status — prevents resurrection of `REJECTED` or `SUPERSEDED` records.
+- Both throw `ForbiddenException` if `record.userId === adminId` — prevents self-approval by an artisan who is also an admin.
+
+#### G. KYC Document Access Token Removed (Claude finding #8)
+
+`getSecureDocumentAccess()` previously returned an `accessToken` computed with a hardcoded `'tark-sec-token'` fallback secret (a no-op security theatre). It now returns only `{ targetUrl, sha256, docType }`. Signed URL delegation is deferred to the CDN layer (Cloudflare R2 signed URL generation is not yet integrated).
+
+#### H. Integer Kobo Arithmetic (Claude findings #9 & #10)
+
+All money arithmetic now uses integer minor units (kobo) to prevent floating-point drift:
+- **Wallet top-up webhook**: `(Math.round(Number(user.walletBalance || 0) * 100) + amountMinor) / 100`
+- **Platform fee**: `Math.round((totalBudgetMinor * 5) / 100) / 100` (5% of kobo amount, integer division)
+- **Dispute wallet credit**: `(Math.round(Number(lockedClient.walletBalance || 0) * 100) + clientRefundMinor) / 100`
+
+#### I. Live DB Role in JWT Strategy (Claude finding #11)
+
+`JwtStrategy.validate()` queries the `User` table on every authenticated request and returns `{ userId: user.id, email: user.email, role: user.role }` from the live row — not from the token payload. A role demotion by an admin takes effect on the next request without requiring a token refresh.
+
+#### J. CORS Allowlist, Password Length Cap, .env.example (Claude finding #12)
+
+- **CORS**: `main.ts` reads `CORS_ALLOWED_ORIGINS` from env (comma-separated) and builds an explicit allowlist (`https://tark.ng`, `https://admin.tark.ng`, localhost ports). `origin: true` (reflect-all) is removed.
+- **Password truncation**: `@MaxLength(72)` added to all four password fields (`RegisterDto.password`, `LoginDto.password`, `ResetPasswordDto.newPassword`, `ChangePasswordDto.currentPassword`, `ChangePasswordDto.newPassword`) — bcrypt silently truncates at 72 bytes; an attacker submitting a 10,000-char password would have its hash collision-exposed.
+- **.env.example**: real Supabase project ref `dousknjnueijzbmvecbn` replaced with placeholder `your-project-ref`.
+
+#### K. Auth Endpoint Inventory (confirmed complete)
+
+| Endpoint | DTO | Guard | Rate Limit |
+|----------|-----|-------|-----------|
+| `POST /auth/register` | `RegisterDto` | None | 10/min |
+| `POST /auth/login` | `LoginDto` | None | 10/min |
+| `POST /auth/forgot-password` | `ForgotPasswordDto` | None | 5/min |
+| `POST /auth/reset-password` | `ResetPasswordDto` | None | 5/min |
+| `POST /auth/change-password` | `ChangePasswordDto` | `JwtAuthGuard` | Global |
+| `GET /auth/me` | — | `JwtAuthGuard` | Global |
+
+All auth DTOs have `@MaxLength(72)` on password fields. `ForgotPasswordDto.email` has a lowercase `@Transform` and `@IsEmail` validator.
+
+#### L. Claude Overclaims (no code action required)
+
+| Claim | Reality |
+|-------|---------|
+| Transfer refs should be `tark-t2-` | Code uses `tark-t1-` and `tark-final-` — this is correct per ADR 002 |
+| "Double-entry wallet ledger" | Ledger is append-only single-entry with a `UNIQUE` reference constraint; true double-entry bookkeeping is out of scope for Phase 1 |
+| "Polyglot pass with magic-byte check" | The magic-byte detector checks the actual binary header, not the MIME claim; polyglot bypass requires a file with a valid JPEG/PNG/MP4 header *and* an embedded payload — documented as a known residual risk in Phase 9 |
+| Handshake PIN in email is a leak | Intentional product decision: the PIN is the client's proof-of-completion and must be communicated to them via a channel the artisan cannot read |
+
+### Verification
+
+All five live test suites re-run against `localhost:3000` backed by Supabase, 2026-11-15:
+
+| Suite | Result |
+|-------|--------|
+| `npx tsc --noEmit` | 0 errors |
+| `npm run build` | clean |
+| `node scripts/test-auth-lifecycle.js` | ALL PASSED (forgot/reset/change-password, tokenVersion, case-collision, >72-char reject) |
+| `node scripts/redteam-active-hack-phase1.js` | 5/5 attacks 100% repelled |
+| `node scripts/redteam-active-hack-phase2.js` | 8/8 attacks 100% repelled |
+| `node scripts/test-kyc-url-validation.js` | ALL PASSED |
+| `node scripts/test-upload-magic-bytes.js` | 41/41 checks passed |
+
+### Known Remaining Gaps (carry-forward to Phase 12)
+
+1. **Multi-currency wallet**: `walletBalance` is a single NGN column; a true multi-currency wallet (NGN, USD, GHS, ZAR) requires a `wallet_balances (userId, currency, balanceMinor)` table, `toMinorUnits(amount, currency)` utility, and gateway routing (Paystack for NGN/GHS/ZAR, Stripe stub for USD — see Phase 12 ADR).
+2. **`CreateJobDto.currency` validation**: `currency` is an unvalidated free string; must be `@IsIn(['NGN', 'USD', 'GHS', 'ZAR'])` with `@Transform(uppercase)`.
+3. **Stale-save on profile update**: `UsersService.updateProfile()` uses `Object.assign(user, dto); repo.save(user)` — should use `repo.update(id, fields)` with an explicit allowlist to prevent concurrent requests overwriting wallet balance or security fields.
+4. **Signed CDN URLs for KYC documents**: `getSecureDocumentAccess()` currently returns only the raw CDN URL; Cloudflare R2 signed-URL generation should be integrated before production KYC goes live.
+5. **Money correctness test suite**: the full Paystack sandbox journey (fund → T1 release → proof → handshake → settle) has no automated test; the escrow service changes are exercised only through unit tests and manual runs.
