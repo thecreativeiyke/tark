@@ -36,6 +36,41 @@
 
 ## 🗓️ Session Log
 
+### 🗓️ 2026-11-15 — Session 18: Phase 12 (Step 2) — Multi-Currency Standardization, Job Currency Validation & Stripe Sandbox Gating
+- **Author**: Lead Engineer (AI Model: Antigravity / Gemini) & Ikechukwu Alaeto (Founder)
+- **Tag**: `[SHIPPED]` `[SECURITY]`
+- **Commit**: `bacd952` pushed to `main`
+
+#### 🎯 What Was Done (Step 2: Multi-Currency & Gateway Hardening):
+1. **`src/common/currency.ts`**:
+   - Single source of truth for supported fiat currencies: `SUPPORTED_CURRENCIES = ['NGN', 'USD', 'GHS', 'ZAR'] as const`.
+   - Normalization (`normalizeCurrency`) and validation (`isSupportedCurrency`).
+   - Minor-unit conversion helpers: `toMinorUnits(amount, currency)` and `fromMinorUnits(amountMinor, currency)` with standard $10^2$ minor-unit scaling across NGN (kobo), USD (cents), GHS (pesewas), and ZAR (cents).
+   - `src/escrow/escrow-policy.ts` re-exports `toMinorUnits` from `src/common/currency` to preserve seamless backward compatibility.
+2. **`CreateJobDto` Currency Validation (`src/jobs/dto/create-job.dto.ts`)**:
+   - Hardened `currency` with `@Transform(({ value }) => typeof value === 'string' ? value.trim().toUpperCase() : value)` and `@IsIn([...SUPPORTED_CURRENCIES])`.
+   - Verified that lowercase variations (`ngn`, `usd`) are safely normalized to uppercase, and unsupported currencies (`EURO`, `GBP`) are rejected with 400 Bad Request.
+3. **Dynamic Payout Bank Discovery (`src/payments/payments.service.ts`)**:
+   - Refactored `getSupportedBanks` to dynamically map requested `currency` to default country (`NGN -> nigeria`, `GHS -> ghana`, `ZAR -> south-africa`, `KES -> kenya`) when `filters.country` is omitted.
+   - Preserves manual `country` override for cross-border bank lookups.
+4. **Stripe Gateway Sandbox Lockdown (`src/payments/gateways/stripe.gateway.ts`)**:
+   - Gated simulated test operations behind `sandboxFallbackAllowed()`.
+   - Enforced strict production safety check: if `NODE_ENV === 'production'`, `initializePayment`, `initiateTransfer`, and `createRecipient` throw `BadGatewayException('Live Stripe processing is not configured for production')`.
+   - `verifyWebhook` rejects all webhook events in production until live Stripe keys and signatures are wired.
+
+#### 🧪 Verification (All 100% Green):
+- `npx tsc --noEmit` → **0 errors**
+- `npm test -- --runInBand` → **74/74 unit tests passing**
+- `npm run build` → **clean build**
+- `node scripts/test-auth-lifecycle.js` → **ALL PASSED**
+- `node scripts/redteam-active-hack-phase1.js` → **5/5 attacks 100% repelled**
+- `node scripts/redteam-active-hack-phase2.js` → **8/8 attacks 100% repelled**
+- `node scripts/test-kyc-url-validation.js` → **ALL PASSED**
+- `node scripts/test-upload-magic-bytes.js` → **41/41 checks passed**
+- Direct runtime validation test: `CreateJobDto` rejects unsupported currency, `StripeGateway` blocks simulated transactions in production.
+
+---
+
 ### 🗓️ 2026-11-15 — Session 17: Phase 12 (Step 1) — Stale-Save Concurrency Elimination
 - **Author**: Lead Engineer (AI Model: Antigravity / Gemini) & Ikechukwu Alaeto (Founder)
 - **Tag**: `[SHIPPED]` `[FLAGGED & FIXED]`
