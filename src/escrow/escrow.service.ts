@@ -1069,9 +1069,8 @@ export class EscrowService implements OnModuleInit, OnModuleDestroy {
   }
 
   async attachPaystackReference(id: string, reference: string) {
-    const escrow = await this.findOne(id);
-    escrow.paystackReference = reference;
-    return this.escrowRepository.save(escrow);
+    await this.escrowRepository.update(id, { paystackReference: reference });
+    return this.findOne(id);
   }
 
   // ─────────────────────────────────────────────────────────────────────

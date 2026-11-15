@@ -397,7 +397,26 @@ export class KycService {
       if (dto.areaCode !== undefined) {
         user.areaCode = this.requireAreaCode(dto.areaCode);
       }
-      await manager.save(user);
+
+      const userUpdate: Partial<User> = {
+        isCertifiedByTark: true,
+        certificationBadgeTitle: user.certificationBadgeTitle,
+        idVerified: true,
+        idType: user.idType,
+        idNumber: user.idNumber,
+        kycStatus: KycStatus.APPROVED,
+        verifiedCategories: user.verifiedCategories,
+      };
+      if (dto.areaCode !== undefined) {
+        userUpdate.areaCode = user.areaCode;
+      }
+      if (user.firstName) {
+        userUpdate.firstName = user.firstName;
+      }
+      if (user.lastName) {
+        userUpdate.lastName = user.lastName;
+      }
+      await manager.update(User, user.id, userUpdate);
 
       // Multi-channel dispatch: Congratulations
       try {

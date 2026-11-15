@@ -287,18 +287,42 @@ export class JobsService {
         `Cannot modify a job once a bid has been accepted or work is underway (Current status: ${job.status})`,
       );
     }
-    Object.assign(job, updateJobDto);
+
+    const updatePayload: Partial<Job> = {};
+    if (updateJobDto.title !== undefined) updatePayload.title = updateJobDto.title;
+    if (updateJobDto.description !== undefined) updatePayload.description = updateJobDto.description;
+    if (updateJobDto.category !== undefined) updatePayload.category = updateJobDto.category;
+    if (updateJobDto.budget !== undefined) updatePayload.budget = updateJobDto.budget;
+    if (updateJobDto.currency !== undefined) updatePayload.currency = updateJobDto.currency;
+    if (updateJobDto.tranche1Amount !== undefined) updatePayload.tranche1Amount = updateJobDto.tranche1Amount;
+    if (updateJobDto.tranche2Amount !== undefined) updatePayload.tranche2Amount = updateJobDto.tranche2Amount;
+    if (updateJobDto.mediaUrls !== undefined) updatePayload.mediaUrls = updateJobDto.mediaUrls;
+    if (updateJobDto.latitude !== undefined) updatePayload.latitude = updateJobDto.latitude;
+    if (updateJobDto.longitude !== undefined) updatePayload.longitude = updateJobDto.longitude;
     if (updateJobDto.location !== undefined) {
-      job.areaCode = deriveAreaCodeFromLocation(job.location);
+      updatePayload.location = updateJobDto.location;
+      updatePayload.areaCode = deriveAreaCodeFromLocation(updateJobDto.location);
     }
-    return this.jobsRepository.save(job);
+
+    if (Object.keys(updatePayload).length > 0) {
+      const res = await this.jobsRepository.update(
+        { id, clientId: userId, status: JobStatus.OPEN },
+        updatePayload,
+      );
+      if (res.affected === 0) {
+        throw new BadRequestException(
+          'Cannot modify a job once a bid has been accepted or work is underway',
+        );
+      }
+      Object.assign(job, updatePayload);
+    }
+    return job;
   }
 
   // System-level status transition called by Escrow / Payment hooks
   async updateStatus(id: string, status: JobStatus) {
-    const job = await this.findOne(id);
-    job.status = status;
-    return this.jobsRepository.save(job);
+    await this.jobsRepository.update(id, { status });
+    return this.findOne(id);
   }
 
   async remove(id: string, userId: string) {

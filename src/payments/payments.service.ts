@@ -400,13 +400,15 @@ export class PaymentsService {
       recipientCode = `RCP_${Date.now()}`;
     }
 
-    user.payoutAccountIdentifier = accountNumber;
-    user.payoutBankOrNetwork = bankCode;
-    user.payoutRecipientCode = recipientCode;
-    user.payoutProvider = gateway.providerName;
+    await this.usersRepository.update(userId, {
+      payoutAccountIdentifier: accountNumber,
+      payoutBankOrNetwork: bankCode,
+      payoutRecipientCode: recipientCode,
+      payoutProvider: gateway.providerName,
+    });
 
-    const savedUser = await this.usersRepository.save(user);
-    const { password: _, ...sanitized } = savedUser;
+    const updatedUser = await this.usersRepository.findOneBy({ id: userId });
+    const { password: _, ...sanitized } = updatedUser!;
 
     return {
       message: 'Artisan payout details saved successfully',
@@ -446,8 +448,8 @@ export class PaymentsService {
           { headers: this.getHeaders() },
         );
         customerCode = customerRes.data.data.customer_code;
+        await this.usersRepository.update(userId, { paystackCustomerCode: customerCode });
         user.paystackCustomerCode = customerCode;
-        await this.usersRepository.save(user);
       } catch (err: any) {
         this.logger.error('Failed to create customer on provider', err?.response?.data || err.message);
         // Never persist a made-up customer code outside sandbox mode.
@@ -457,8 +459,8 @@ export class PaymentsService {
           );
         }
         customerCode = `CUS_${Date.now()}`;
+        await this.usersRepository.update(userId, { paystackCustomerCode: customerCode });
         user.paystackCustomerCode = customerCode;
-        await this.usersRepository.save(user);
       }
     }
 
@@ -473,9 +475,12 @@ export class PaymentsService {
       );
 
       const dvaData = dvaRes.data.data;
+      await this.usersRepository.update(userId, {
+        virtualAccountNumber: dvaData.account_number,
+        virtualBankName: dvaData.bank.name,
+      });
       user.virtualAccountNumber = dvaData.account_number;
       user.virtualBankName = dvaData.bank.name;
-      await this.usersRepository.save(user);
     } catch (error: any) {
       // A fake account number could receive REAL money from a real bank customer.
       // Only ever simulate one in non-production sandbox mode.
@@ -486,9 +491,14 @@ export class PaymentsService {
         );
       }
       this.logger.warn(`DVA live provision unavailable. Activating Sandbox DVA.`);
-      user.virtualAccountNumber = `96${Math.floor(10000000 + Math.random() * 90000000)}`;
-      user.virtualBankName = 'Paystack-Titan (Sandbox)';
-      await this.usersRepository.save(user);
+      const sandboxAccount = `96${Math.floor(10000000 + Math.random() * 90000000)}`;
+      const sandboxBank = 'Paystack-Titan (Sandbox)';
+      await this.usersRepository.update(userId, {
+        virtualAccountNumber: sandboxAccount,
+        virtualBankName: sandboxBank,
+      });
+      user.virtualAccountNumber = sandboxAccount;
+      user.virtualBankName = sandboxBank;
     }
 
     return {

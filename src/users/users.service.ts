@@ -139,11 +139,30 @@ export class UsersService {
     if (!user) {
       throw new NotFoundException('User not found');
     }
-    Object.assign(user, dto);
-    const saved = await this.usersRepository.save(user);
+
+    const allowed: Partial<User> = {};
+    if (dto.fullName !== undefined) allowed.fullName = dto.fullName;
+    if (dto.phoneNumber !== undefined) allowed.phoneNumber = dto.phoneNumber;
+    if (dto.skills !== undefined) allowed.skills = dto.skills;
+    if (dto.latitude !== undefined) allowed.latitude = dto.latitude;
+    if (dto.longitude !== undefined) allowed.longitude = dto.longitude;
+    if (dto.idType !== undefined) allowed.idType = dto.idType;
+    if (dto.idNumber !== undefined) allowed.idNumber = dto.idNumber;
+
+    if (Object.keys(allowed).length > 0) {
+      const res = await this.usersRepository.update(userId, allowed);
+      if (res.affected === 0) {
+        throw new NotFoundException('User not found');
+      }
+    }
+
+    const updated = await this.findOne(userId);
+    if (!updated) {
+      throw new NotFoundException('User not found');
+    }
 
     // Strip password from returned payload
-    const { password: _, ...sanitized } = saved;
+    const { password: _, ...sanitized } = updated;
     return sanitized;
   }
 

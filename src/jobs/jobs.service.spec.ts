@@ -83,6 +83,7 @@ describe('JobsService', () => {
       findOneBy: jest.fn(),
       create: jest.fn((x) => x),
       save: jest.fn((x) => Promise.resolve(x)),
+      update: jest.fn().mockResolvedValue({ affected: 1 }),
     };
     usersRepo = { findOne: jest.fn() };
     categoriesService = { resolveCategory: jest.fn() };
