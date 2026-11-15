@@ -36,6 +36,38 @@
 
 ## 🗓️ Session Log
 
+### 🗓️ 2026-11-15 — Session 17: Phase 12 (Step 1) — Stale-Save Concurrency Elimination
+- **Author**: Lead Engineer (AI Model: Antigravity / Gemini) & Ikechukwu Alaeto (Founder)
+- **Tag**: `[SHIPPED]` `[FLAGGED & FIXED]`
+- **Commit**: `ebda952` pushed to `main`
+
+#### 🎯 What Was Done (Step 1: Stale-Save Concurrency Elimination):
+1. **`UsersService.updateProfile` (`src/users/users.service.ts`)**:
+   - Eliminated `Object.assign(user, dto)` + whole-entity `save(user)`.
+   - Replaced with atomic `this.usersRepository.update(userId, allowed)` restricted strictly to an explicit allowlist of profile fields (`fullName`, `phoneNumber`, `skills`, `latitude`, `longitude`, `idType`, `idNumber`).
+   - Reloads fresh sanitized user, guaranteeing that concurrent wallet balance top-ups, `tokenVersion` bumps, and admin KYC scopes are never overwritten.
+2. **`PaymentsService.saveArtisanBank` & `assignDedicatedVirtualAccount` (`src/payments/payments.service.ts`)**:
+   - Replaced whole-entity saves on `User` with atomic `.update()` calls for payout identifier/recipient fields and virtual account metadata (`paystackCustomerCode`, `virtualAccountNumber`, `virtualBankName`).
+3. **`EscrowService.attachPaystackReference` (`src/escrow/escrow.service.ts`)**:
+   - Replaced `.save()` on un-locked escrow entity with atomic `this.escrowRepository.update(id, { paystackReference: reference })`.
+4. **`JobsService.updateStatus` & `update` (`src/jobs/jobs.service.ts`)**:
+   - `updateStatus`: replaced read-modify-write `.save(job)` with atomic `this.jobsRepository.update(id, { status })`.
+   - `update`: replaced `save(job)` with atomic `this.jobsRepository.update({ id, clientId: userId, status: JobStatus.OPEN }, updatePayload)`. Guarantees zero rows affected if job status changes concurrently away from `OPEN`.
+5. **`KycService.approveKyc` (`src/kyc/kyc.service.ts`)**:
+   - Replaced relation-loaded `await manager.save(user)` with atomic `await manager.update(User, user.id, userUpdate)`.
+
+#### 🧪 Verification (All 100% Green):
+- `npx tsc --noEmit` → **0 errors**
+- `npm test -- --runInBand` → **74/74 unit tests passing**
+- `npm run build` → **clean build**
+- `node scripts/test-auth-lifecycle.js` → **ALL PASSED**
+- `node scripts/redteam-active-hack-phase1.js` → **5/5 attacks 100% repelled**
+- `node scripts/redteam-active-hack-phase2.js` → **8/8 attacks 100% repelled**
+- `node scripts/test-kyc-url-validation.js` → **ALL PASSED**
+- `node scripts/test-upload-magic-bytes.js` → **41/41 checks passed**
+
+---
+
 ### 🗓️ 2026-11-15 — Session 16: Claude Audit Response, Full Re-Verification & Auth Lifecycle Hardening
 - **Author**: Lead Engineer (AI Model: Antigravity / Gemini) & Ikechukwu Alaeto (Founder)
 - **Tag**: `[AUDIT]` `[FLAGGED & FIXED]` — Full rationale in Phase 11 amendment of [ADR 009](./docs/adr/009-security-hardening-phase1-phase2.md)
